@@ -34,3 +34,13 @@ func (c *Conversation) AddAssistant(text string) {
 func (c *Conversation) Messages() []llm.Message {
 	return c.messages
 }
+
+// MessageCount 返回消息数量
+func (c *Conversation) MessageCount() int {
+	return len(c.messages)
+}
+
+// Clear 清空对话历史
+func (c *Conversation) Clear() {
+	c.messages = make([]llm.Message, 0)
+}

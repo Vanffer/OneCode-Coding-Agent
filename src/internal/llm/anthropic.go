@@ -3,12 +3,16 @@ package llm
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"onecode/internal/config"
 	"onecode/internal/prompt"
 )
+
+// anthropicStreamIdleTimeout 流式空闲超时
+const anthropicStreamIdleTimeout = 5 * time.Minute
 
 // anthropicProvider 实现 Anthropic Claude 的 Provider 接口
 type anthropicProvider struct {
@@ -78,27 +82,67 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) <-chan S
 
 		// 创建流式请求
 		stream := p.client.Messages.NewStreaming(ctx, params)
+		defer stream.Close()
 
-		// 迭代流式响应
-		for stream.Next() {
+		// 空闲超时计时器
+		idle := time.NewTimer(anthropicStreamIdleTimeout)
+		defer idle.Stop()
+
+		// 用独立 goroutine 读取 SSE，以便检测连接静默断开
+		type sseResult struct {
+			hasNext bool
+			err     error
+		}
+		nextCh := make(chan sseResult, 1)
+		readNext := func() {
+			next := stream.Next()
+			nextCh <- sseResult{hasNext: next}
+		}
+
+		go readNext()
+		for {
+			var res sseResult
+			select {
+			case <-ctx.Done():
+				ch <- StreamEvent{Err: &NetworkError{Message: "上下文已取消"}}
+				return
+			case <-idle.C:
+				ch <- StreamEvent{Err: &NetworkError{Message: "流式连接超时，无数据传输超过 5 分钟"}}
+				return
+			case res = <-nextCh:
+			}
+
+			// 重置空闲计时器
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(anthropicStreamIdleTimeout)
+
+			if !res.hasNext {
+				break
+			}
+
 			event := stream.Current()
-
-			// 处理内容块增量
 			switch variant := event.AsAny().(type) {
 			case anthropic.ContentBlockDeltaEvent:
 				switch delta := variant.Delta.AsAny().(type) {
 				case anthropic.TextDelta:
 					ch <- StreamEvent{Text: delta.Text}
 				case anthropic.ThinkingDelta:
-					// 思考增量丢弃
+					// 思考增量丢弃（basic-chat 阶段不暴露）
 					continue
 				}
 			}
+
+			go readNext()
 		}
 
 		// 检查错误
 		if err := stream.Err(); err != nil && err != io.EOF {
-			ch <- StreamEvent{Err: err}
+			ch <- StreamEvent{Err: classifyAnthropicError(err)}
 			return
 		}
 

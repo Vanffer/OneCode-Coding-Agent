@@ -12,7 +12,6 @@ type Message struct {
 type StreamEvent struct {
 	Text string // 文本增量
 	Done bool   // 本轮正常结束
-	Err  error  // 出错（与 Done 互斥）
 }
 
 // Provider 定义 LLM Provider 的统一接口
@@ -23,6 +22,7 @@ type Provider interface {
 	Model() string
 	// Stream 发起一轮流式对话
 	// 内部注入内置 system prompt 与 thinking 配置；思考增量内部丢弃
-	// 通过 channel 吐出文本增量/结束/错误；ctx 取消即终止
-	Stream(ctx context.Context, msgs []Message) <-chan StreamEvent
+	// events 吐出文本增量和结束信号；errs 吐出错误（与 events 互斥）
+	// ctx 取消即终止；两个 channel 都由实现方关闭
+	Stream(ctx context.Context, msgs []Message) (<-chan StreamEvent, <-chan error)
 }

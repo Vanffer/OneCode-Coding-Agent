@@ -47,11 +47,13 @@ func (p *openaiProvider) Model() string {
 }
 
 // Stream 发起流式对话
-func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) <-chan StreamEvent {
-	ch := make(chan StreamEvent, 1)
+func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan StreamEvent, <-chan error) {
+	events := make(chan StreamEvent, 1)
+	errs := make(chan error, 1)
 
 	go func() {
-		defer close(ch)
+		defer close(events)
+		defer close(errs)
 
 		// 转换消息格式，首条插入 system message
 		messages := []openai.ChatCompletionMessageParamUnion{
@@ -95,10 +97,10 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) <-chan Stre
 			var res sseResult
 			select {
 			case <-ctx.Done():
-				ch <- StreamEvent{Err: &NetworkError{Message: "上下文已取消"}}
+				errs <- &NetworkError{Message: "上下文已取消"}
 				return
 			case <-idle.C:
-				ch <- StreamEvent{Err: &NetworkError{Message: "流式连接超时，无数据传输超过 5 分钟"}}
+				errs <- &NetworkError{Message: "流式连接超时，无数据传输超过 5 分钟"}
 				return
 			case res = <-nextCh:
 			}
@@ -118,7 +120,7 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) <-chan Stre
 
 			event := stream.Current()
 			if len(event.Choices) > 0 && event.Choices[0].Delta.Content != "" {
-				ch <- StreamEvent{Text: event.Choices[0].Delta.Content}
+				events <- StreamEvent{Text: event.Choices[0].Delta.Content}
 			}
 
 			go readNext()
@@ -126,13 +128,13 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) <-chan Stre
 
 		// 检查错误
 		if err := stream.Err(); err != nil && err != io.EOF {
-			ch <- StreamEvent{Err: classifyOpenAIError(err)}
+			errs <- classifyOpenAIError(err)
 			return
 		}
 
 		// 正常结束
-		ch <- StreamEvent{Done: true}
+		events <- StreamEvent{Done: true}
 	}()
 
-	return ch
+	return events, errs
 }

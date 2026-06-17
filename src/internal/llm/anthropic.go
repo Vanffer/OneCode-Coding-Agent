@@ -47,11 +47,13 @@ func (p *anthropicProvider) Model() string {
 }
 
 // Stream 发起流式对话
-func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) <-chan StreamEvent {
-	ch := make(chan StreamEvent, 1)
+func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan StreamEvent, <-chan error) {
+	events := make(chan StreamEvent, 1)
+	errs := make(chan error, 1)
 
 	go func() {
-		defer close(ch)
+		defer close(events)
+		defer close(errs)
 
 		// 转换消息格式
 		messages := make([]anthropic.MessageParam, len(msgs))
@@ -91,7 +93,6 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) <-chan S
 		// 用独立 goroutine 读取 SSE，以便检测连接静默断开
 		type sseResult struct {
 			hasNext bool
-			err     error
 		}
 		nextCh := make(chan sseResult, 1)
 		readNext := func() {
@@ -104,10 +105,10 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) <-chan S
 			var res sseResult
 			select {
 			case <-ctx.Done():
-				ch <- StreamEvent{Err: &NetworkError{Message: "上下文已取消"}}
+				errs <- &NetworkError{Message: "上下文已取消"}
 				return
 			case <-idle.C:
-				ch <- StreamEvent{Err: &NetworkError{Message: "流式连接超时，无数据传输超过 5 分钟"}}
+				errs <- &NetworkError{Message: "流式连接超时，无数据传输超过 5 分钟"}
 				return
 			case res = <-nextCh:
 			}
@@ -130,7 +131,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) <-chan S
 			case anthropic.ContentBlockDeltaEvent:
 				switch delta := variant.Delta.AsAny().(type) {
 				case anthropic.TextDelta:
-					ch <- StreamEvent{Text: delta.Text}
+					events <- StreamEvent{Text: delta.Text}
 				case anthropic.ThinkingDelta:
 					// 思考增量丢弃（basic-chat 阶段不暴露）
 					continue
@@ -142,13 +143,13 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) <-chan S
 
 		// 检查错误
 		if err := stream.Err(); err != nil && err != io.EOF {
-			ch <- StreamEvent{Err: classifyAnthropicError(err)}
+			errs <- classifyAnthropicError(err)
 			return
 		}
 
 		// 正常结束
-		ch <- StreamEvent{Done: true}
+		events <- StreamEvent{Done: true}
 	}()
 
-	return ch
+	return events, errs
 }

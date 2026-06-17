@@ -34,7 +34,8 @@ type Model struct {
 	providers   []config.ProviderConfig
 	provider    llm.Provider
 	conv        *conversation.Conversation
-	events      <-chan llm.StreamEvent // 当前流
+	events      <-chan llm.StreamEvent // 当前流事件
+	errs        <-chan error           // 当前流错误
 	curReply    *strings.Builder       // 本轮 assistant 增量缓冲（动态区显示，Done 后提交 scrollback）
 	turnStart   time.Time              // 计时起点
 	width, height int
@@ -44,6 +45,9 @@ type Model struct {
 
 // streamMsg 包装 llm.StreamEvent 用于 tea.Msg
 type streamMsg llm.StreamEvent
+
+// errMsg 包装 error 用于 tea.Msg
+type errMsg struct{ err error }
 
 // New 创建新的 TUI 模型
 func New(providers []config.ProviderConfig) Model {
@@ -107,6 +111,17 @@ func waitForEvent(ch <-chan llm.StreamEvent) tea.Cmd {
 			return streamMsg{Done: true}
 		}
 		return streamMsg(event)
+	}
+}
+
+// waitForErr 读取一个错误并返回 errMsg
+func waitForErr(ch <-chan error) tea.Cmd {
+	return func() tea.Msg {
+		err, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return errMsg{err: err}
 	}
 }
 
@@ -191,13 +206,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// 开始流式请求
 				ctx := context.Background()
-				m.events = m.provider.Stream(ctx, m.conv.Messages())
+				m.events, m.errs = m.provider.Stream(ctx, m.conv.Messages())
 				m.curReply.Reset()
 				m.turnStart = time.Now()
 				m.state = stateStreaming
 
-				// 启动事件监听和 spinner
-				cmds = append(cmds, waitForEvent(m.events), m.spinner.Tick)
+				// 启动事件监听、错误监听和 spinner
+				cmds = append(cmds, waitForEvent(m.events), waitForErr(m.errs), m.spinner.Tick)
 				return m, tea.Batch(cmds...)
 			}
 		}
@@ -220,16 +235,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
-	case streamMsg:
-		if msg.Err != nil {
-			// 错误处理
-			m.err = msg.Err
-			cmds = append(cmds, tea.Println(fmt.Sprintf("\n❌ Error: %s\n", msg.Err.Error())))
-			m.state = stateIdle
-			m.textarea.Focus()
-			return m, tea.Batch(cmds...)
-		}
+	case errMsg:
+		// 错误处理
+		m.err = msg.err
+		cmds = append(cmds, tea.Println(fmt.Sprintf("\n❌ Error: %s\n", msg.err.Error())))
+		m.state = stateIdle
+		m.textarea.Focus()
+		return m, tea.Batch(cmds...)
 
+	case streamMsg:
 		if msg.Done {
 			// 流式完成，渲染 markdown
 			if m.curReply.Len() > 0 {

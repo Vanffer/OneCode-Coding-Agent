@@ -1,0 +1,32 @@
+# OneCode 配置文件
+# 请将 api_key 替换为你的实际 API 密钥
+
+providers:
+  # Anthropic Claude 官方 API
+  - name: Claude
+    protocol: anthropic
+    api_key: YOUR_ANTHROPIC_API_KEY
+    model: claude-4.6-opus
+    base_url: ""  # 留空使用官方 API
+    thinking: false
+
+  # OpenAI 官方 API
+  - name: GPT-4
+    protocol: openai
+    api_key: YOUR_OPENAI_API_KEY
+    model: gpt-4
+    base_url: ""  # 留空使用官方 API
+
+  # 第三方供应商示例（如 OpenRouter、OneAPI 等）
+  - name: Claude-Via-ThirdParty
+    protocol: anthropic
+    api_key: YOUR_THIRD_PARTY_API_KEY
+    model: claude-4.6-opus
+    base_url: https://api.example.com/v1  # 第三方 API 端点
+    thinking: false
+
+  - name: DeepSeek
+    protocol: openai
+    api_key: YOUR_DEEPSEEK_API_KEY
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com  # 第三方 API 端点

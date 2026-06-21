@@ -5,10 +5,11 @@ import (
 	"io"
 	"time"
 
-	"github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
 	"onecode/internal/config"
 	"onecode/internal/prompt"
+
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
 )
 
 // openaiStreamIdleTimeout 流式空闲超时
@@ -78,7 +79,8 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan Str
 		stream := p.client.Chat.Completions.NewStreaming(ctx, params)
 		defer stream.Close()
 
-		// 空闲超时计时器
+		// 空闲超时计时器：5 分钟没有数据传输则超时
+		// 收到数据时需重置，触发后 idle.C 会有信号
 		idle := time.NewTimer(openaiStreamIdleTimeout)
 		defer idle.Stop()
 
@@ -106,13 +108,15 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan Str
 			}
 
 			// 重置空闲计时器
+			// Stop() 返回 false 表示 Timer 已触发，idle.C 里有旧信号
+			// 必须先读掉旧信号，否则下次 select 会误判为超时
 			if !idle.Stop() {
 				select {
-				case <-idle.C:
+				case <-idle.C: // 清空旧信号
 				default:
 				}
 			}
-			idle.Reset(openaiStreamIdleTimeout)
+			idle.Reset(openaiStreamIdleTimeout) // 安全重置，重新开始 5 分钟倒计时
 
 			if !res.hasNext {
 				break
@@ -120,7 +124,13 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan Str
 
 			event := stream.Current()
 			if len(event.Choices) > 0 && event.Choices[0].Delta.Content != "" {
-				events <- StreamEvent{Text: event.Choices[0].Delta.Content}
+				select {
+				case events <- StreamEvent{Text: event.Choices[0].Delta.Content}:
+					// 写入成功
+				case <-ctx.Done():
+					// 用户取消，立即退出
+					return
+				}
 			}
 
 			go readNext()
@@ -128,12 +138,24 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan Str
 
 		// 检查错误
 		if err := stream.Err(); err != nil && err != io.EOF {
-			errs <- classifyOpenAIError(err)
+			select {
+			case errs <- classifyOpenAIError(err):
+				// 写入成功
+			case <-ctx.Done():
+				// 用户取消，立即退出
+				return
+			}
 			return
 		}
 
 		// 正常结束
-		events <- StreamEvent{Done: true}
+		select {
+		case events <- StreamEvent{Done: true}:
+			// 写入成功
+		case <-ctx.Done():
+			// 用户取消，立即退出
+			return
+		}
 	}()
 
 	return events, errs

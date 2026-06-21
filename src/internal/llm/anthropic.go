@@ -131,7 +131,13 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan 
 			case anthropic.ContentBlockDeltaEvent:
 				switch delta := variant.Delta.AsAny().(type) {
 				case anthropic.TextDelta:
-					events <- StreamEvent{Text: delta.Text}
+					select {
+					case events <- StreamEvent{Text: delta.Text}:
+						// 写入成功
+					case <-ctx.Done():
+						// 用户取消，立即退出
+						return
+					}
 				case anthropic.ThinkingDelta:
 					// 思考增量丢弃（basic-chat 阶段不暴露）
 					continue
@@ -143,12 +149,24 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan 
 
 		// 检查错误
 		if err := stream.Err(); err != nil && err != io.EOF {
-			errs <- classifyAnthropicError(err)
+			select {
+			case errs <- classifyAnthropicError(err):
+				// 写入成功
+			case <-ctx.Done():
+				// 用户取消，立即退出
+				return
+			}
 			return
 		}
 
 		// 正常结束
-		events <- StreamEvent{Done: true}
+		select {
+		case events <- StreamEvent{Done: true}:
+			// 写入成功
+		case <-ctx.Done():
+			// 用户取消，立即退出
+			return
+		}
 	}()
 
 	return events, errs

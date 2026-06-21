@@ -6,13 +6,14 @@ import (
 	"strings"
 	"time"
 
+	"onecode/internal/config"
+	"onecode/internal/conversation"
+	"onecode/internal/llm"
+
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
-	"onecode/internal/config"
-	"onecode/internal/conversation"
-	"onecode/internal/llm"
 )
 
 // sessionState 表示 TUI 的会话状态
@@ -26,21 +27,23 @@ const (
 
 // Model 是 TUI 的主模型
 type Model struct {
-	state       sessionState
-	textarea    textarea.Model
-	spinner     spinner.Model
-	selectIndex int                   // provider 选择索引
-	renderer    *glamour.TermRenderer
-	providers   []config.ProviderConfig
-	provider    llm.Provider
-	conv        *conversation.Conversation
-	events      <-chan llm.StreamEvent // 当前流事件
-	errs        <-chan error           // 当前流错误
-	curReply    *strings.Builder       // 本轮 assistant 增量缓冲（动态区显示，Done 后提交 scrollback）
-	turnStart   time.Time              // 计时起点
-	width, height int
-	ready       bool                   // 界面是否已初始化
-	err         error                  // 错误信息
+	state           sessionState
+	textarea        textarea.Model
+	spinner         spinner.Model
+	selectIndex     int // provider 选择索引
+	renderer        *glamour.TermRenderer
+	providers       []config.ProviderConfig
+	provider        llm.Provider
+	conv            *conversation.Conversation
+	events          <-chan llm.StreamEvent // 当前流事件
+	errs            <-chan error           // 当前流错误
+	curReply        *strings.Builder       // 本轮 assistant 增量缓冲（动态区显示，Done 后提交 scrollback）
+	pendingChars    int                    // 待渲染字符数（用于批量更新）
+	pendingMarkdown string                 // 待打印的 markdown（延迟一帧打印，确保最后的流式文本被渲染）
+	turnStart       time.Time              // 计时起点
+	width, height   int
+	ready           bool  // 界面是否已初始化
+	err             error // 错误信息
 }
 
 // streamMsg 包装 llm.StreamEvent 用于 tea.Msg
@@ -48,6 +51,12 @@ type streamMsg llm.StreamEvent
 
 // errMsg 包装 error 用于 tea.Msg
 type errMsg struct{ err error }
+
+// tickMsg 定时触发的消息，用于批量更新
+type tickMsg time.Time
+
+// doneMsg 流式完成后的延迟消息，用于确保最后的流式文本被渲染
+type doneMsg struct{}
 
 // New 创建新的 TUI 模型
 func New(providers []config.ProviderConfig) Model {
@@ -101,6 +110,13 @@ func (m Model) Init() tea.Cmd {
 		textarea.Blink,
 		m.spinner.Tick,
 	)
+}
+
+// renderTick 启动定时渲染（每 50ms 触发一次，用于批量更新）
+func renderTick() tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
 // waitForEvent 读取一个事件并返回 streamMsg
@@ -211,8 +227,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.turnStart = time.Now()
 				m.state = stateStreaming
 
-				// 启动事件监听、错误监听和 spinner
-				cmds = append(cmds, waitForEvent(m.events), waitForErr(m.errs), m.spinner.Tick)
+				// 启动事件监听、错误监听、spinner 和定时渲染
+				cmds = append(cmds, waitForEvent(m.events), waitForErr(m.errs), m.spinner.Tick, renderTick())
 				return m, tea.Batch(cmds...)
 			}
 		}
@@ -235,6 +251,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
+	case tickMsg:
+		// 定时渲染：流式状态下每 50ms 强制重绘一次
+		if m.state == stateStreaming && m.pendingChars > 0 {
+			m.pendingChars = 0
+			// 触发重绘（通过返回 nil Cmd 让 View 重新执行）
+		}
+		if m.state == stateStreaming {
+			cmds = append(cmds, renderTick())
+		}
+
 	case errMsg:
 		// 错误处理
 		m.err = msg.err
@@ -245,7 +271,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamMsg:
 		if msg.Done {
-			// 流式完成，渲染 markdown
+			// 流式完成，但不立即渲染 markdown
+			// 延迟一帧，让 View 有机会渲染完最后的流式文本
+			m.pendingChars = 0
 			if m.curReply.Len() > 0 {
 				rendered, err := m.renderer.Render(m.curReply.String())
 				if err != nil {
@@ -253,21 +281,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.conv.AddAssistant(m.curReply.String())
 				elapsed := time.Since(m.turnStart).Seconds()
-				cmds = append(cmds, tea.Println(fmt.Sprintf("\n%s\n⏱  %.1fs\n", rendered, elapsed)))
+				m.pendingMarkdown = fmt.Sprintf("\n%s\n⏱  %.1fs\n", rendered, elapsed)
 			}
-			m.state = stateIdle
-			m.textarea.Focus()
-			return m, tea.Batch(cmds...)
+			// 延迟 50ms 后打印 markdown
+			return m, tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+				return doneMsg{}
+			})
 		}
 
-		// 文本增量
+		// 累积流式内容
 		if msg.Text != "" {
 			m.curReply.WriteString(msg.Text)
+			m.pendingChars++
 			// 不在这里打印，通过 View 渲染
 		}
 
 		// 续读下一个事件
 		cmds = append(cmds, waitForEvent(m.events))
+
+	case doneMsg:
+		// 打印延迟的 markdown
+		if m.pendingMarkdown != "" {
+			cmds = append(cmds, tea.Println(m.pendingMarkdown))
+			m.pendingMarkdown = ""
+		}
+		m.state = stateIdle
+		m.textarea.Focus()
+		return m, tea.Batch(cmds...)
 	}
 
 	return m, tea.Batch(cmds...)

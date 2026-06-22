@@ -2,11 +2,14 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"onecode/internal/config"
 	"onecode/internal/prompt"
 )
@@ -47,7 +50,7 @@ func (p *anthropicProvider) Model() string {
 }
 
 // Stream 发起流式对话
-func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan StreamEvent, <-chan error) {
+func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition) (<-chan StreamEvent, <-chan error) {
 	events := make(chan StreamEvent, 1)
 	errs := make(chan error, 1)
 
@@ -56,12 +59,28 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan 
 		defer close(errs)
 
 		// 转换消息格式
-		messages := make([]anthropic.MessageParam, len(msgs))
-		for i, msg := range msgs {
-			if msg.Role == "user" {
-				messages[i] = anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content))
-			} else {
-				messages[i] = anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content))
+		messages := make([]anthropic.MessageParam, 0, len(msgs))
+		hasToolUse := false
+		for _, msg := range msgs {
+			if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+				// assistant 消息带工具调用
+				hasToolUse = true
+				blocks := make([]anthropic.ContentBlockParamUnion, 0, len(msg.ToolCalls)+1)
+				if msg.Content != "" {
+					blocks = append(blocks, anthropic.NewTextBlock(msg.Content))
+				}
+				for _, tc := range msg.ToolCalls {
+					blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, tc.Input, tc.Name))
+				}
+				messages = append(messages, anthropic.NewAssistantMessage(blocks...))
+			} else if msg.Role == "tool" && msg.ToolResult != nil {
+				// 工具结果：作为 user 消息的 tool_result 块
+				resultBlock := anthropic.NewToolResultBlock(msg.ToolResult.ToolUseID, msg.ToolResult.Content, msg.ToolResult.IsError)
+				messages = append(messages, anthropic.NewUserMessage(resultBlock))
+			} else if msg.Role == "user" {
+				messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content)))
+			} else if msg.Role == "assistant" {
+				messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content)))
 			}
 		}
 
@@ -75,8 +94,39 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan 
 			Messages: messages,
 		}
 
-		// 如果启用 thinking
-		if p.cfg.Thinking {
+		// 注入工具定义
+		if len(tools) > 0 {
+			anthropicTools := make([]anthropic.ToolUnionParam, len(tools))
+			for i, t := range tools {
+				toolParam := anthropic.ToolParam{
+					Name: t.Name,
+					Description: param.Opt[string]{
+						Value: t.Description,
+					},
+					InputSchema: anthropic.ToolInputSchemaParam{
+						Properties: t.Schema["properties"],
+					},
+				}
+				// 设置 required 字段
+				if required, ok := t.Schema["required"]; ok {
+					if reqSlice, ok := required.([]string); ok {
+						toolParam.InputSchema.Required = reqSlice
+					}
+				}
+				anthropicTools[i] = anthropic.ToolUnionParam{
+					OfTool: &toolParam,
+				}
+			}
+			params.Tools = anthropicTools
+
+			// 历史含工具交互时关闭 thinking
+			if hasToolUse {
+				params.Thinking = anthropic.ThinkingConfigParamUnion{}
+			}
+		}
+
+		// 如果启用 thinking（无工具时）
+		if p.cfg.Thinking && len(tools) == 0 {
 			params.Thinking = anthropic.ThinkingConfigParamUnion{
 				OfEnabled: &anthropic.ThinkingConfigEnabledParam{},
 			}
@@ -99,6 +149,12 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan 
 			next := stream.Next()
 			nextCh <- sseResult{hasNext: next}
 		}
+
+		// 工具调用状态
+		var toolUseID string
+		var toolUseName string
+		var toolUseJSON strings.Builder
+		inToolUse := false
 
 		go readNext()
 		for {
@@ -128,6 +184,15 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan 
 
 			event := stream.Current()
 			switch variant := event.AsAny().(type) {
+			case anthropic.ContentBlockStartEvent:
+				// 检查是否是 tool_use 块
+				if variant.ContentBlock.Type == "tool_use" {
+					inToolUse = true
+					toolUseID = variant.ContentBlock.ID
+					toolUseName = variant.ContentBlock.Name
+					toolUseJSON.Reset()
+				}
+
 			case anthropic.ContentBlockDeltaEvent:
 				switch delta := variant.Delta.AsAny().(type) {
 				case anthropic.TextDelta:
@@ -138,9 +203,45 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message) (<-chan 
 						// 用户取消，立即退出
 						return
 					}
+				case anthropic.InputJSONDelta:
+					if inToolUse {
+						toolUseJSON.WriteString(delta.PartialJSON)
+					}
 				case anthropic.ThinkingDelta:
-					// 思考增量丢弃（basic-chat 阶段不暴露）
+					// 思考增量丢弃
 					continue
+				}
+
+			case anthropic.ContentBlockStopEvent:
+				if inToolUse {
+					// 解析完整的 JSON 参数
+					var input map[string]interface{}
+					jsonStr := toolUseJSON.String()
+					if jsonStr == "" {
+						jsonStr = "{}"
+					}
+					if err := json.Unmarshal([]byte(jsonStr), &input); err != nil {
+						errs <- &LLMError{Message: "工具参数解析失败: " + err.Error()}
+						return
+					}
+
+					// 吐出工具调用事件
+					select {
+					case events <- StreamEvent{ToolCall: &ToolCall{
+						ID:    toolUseID,
+						Name:  toolUseName,
+						Input: input,
+					}}:
+						// 写入成功
+					case <-ctx.Done():
+						return
+					}
+
+					// 重置状态
+					inToolUse = false
+					toolUseID = ""
+					toolUseName = ""
+					toolUseJSON.Reset()
 				}
 			}
 

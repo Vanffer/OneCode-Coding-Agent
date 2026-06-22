@@ -1,0 +1,22 @@
+# 配置文件（含 API 密钥）
+.onecode/config.yaml
+
+# Go 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go 测试覆盖率
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

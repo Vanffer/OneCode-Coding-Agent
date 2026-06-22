@@ -30,6 +30,22 @@ func (c *Conversation) AddAssistant(text string) {
 	})
 }
 
+// AddAssistantWithToolCalls 添加带工具调用的助手消息
+func (c *Conversation) AddAssistantWithToolCalls(toolCalls []llm.ToolCall) {
+	c.messages = append(c.messages, llm.Message{
+		Role:      "assistant",
+		ToolCalls: toolCalls,
+	})
+}
+
+// AddToolResult 添加工具结果消息
+func (c *Conversation) AddToolResult(result llm.ToolResult) {
+	c.messages = append(c.messages, llm.Message{
+		Role:       "tool",
+		ToolResult: &result,
+	})
+}
+
 // Messages 返回完整的消息历史
 func (c *Conversation) Messages() []llm.Message {
 	return c.messages

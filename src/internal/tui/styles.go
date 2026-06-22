@@ -32,4 +32,19 @@ var (
 	promptStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("205")).
 			Bold(true)
+
+	// 工具行样式
+	toolNameStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("141")). // 紫色
+			Bold(true)
+
+	toolArgsStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("245")) // 灰色
+
+	toolResultStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("245")) // 灰色
+
+	toolErrorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")). // 红色
+			Bold(true)
 )

@@ -8,7 +8,7 @@
 
 ## 开发流程
 
-本项目使用 Spec 驱动开发流程。在开始任何功能开发前，运行 `/mew-spec` 启动流程：
+本项目使用 Spec 驱动开发流程。在开始任何功能开发前，运行 `/one-spec` 启动流程：
 
 ```
 spec.md → plan.md → task.md → checklist.md → 开发 → 验收

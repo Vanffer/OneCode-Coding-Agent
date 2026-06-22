@@ -6,9 +6,11 @@ import (
 	"strings"
 	"time"
 
+	"onecode/internal/agent"
 	"onecode/internal/config"
 	"onecode/internal/conversation"
 	"onecode/internal/llm"
+	"onecode/internal/tools"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
@@ -34,32 +36,30 @@ type Model struct {
 	renderer        *glamour.TermRenderer
 	providers       []config.ProviderConfig
 	provider        llm.Provider
+	agent           *agent.Agent
+	registry        *tools.Registry
 	conv            *conversation.Conversation
-	events          <-chan llm.StreamEvent // 当前流事件
-	errs            <-chan error           // 当前流错误
-	curReply        *strings.Builder       // 本轮 assistant 增量缓冲（动态区显示，Done 后提交 scrollback）
-	pendingChars    int                    // 待渲染字符数（用于批量更新）
-	pendingMarkdown string                 // 待打印的 markdown（延迟一帧打印，确保最后的流式文本被渲染）
-	turnStart       time.Time              // 计时起点
+	agentEvents     <-chan agent.Event // 当前 agent 事件
+	curReply        *strings.Builder   // 本轮 assistant 增量缓冲
+	pendingChars    int                // 待渲染字符数（用于批量更新）
+	pendingMarkdown string             // 待打印的 markdown
+	turnStart       time.Time          // 计时起点
 	width, height   int
 	ready           bool  // 界面是否已初始化
 	err             error // 错误信息
 }
 
-// streamMsg 包装 llm.StreamEvent 用于 tea.Msg
-type streamMsg llm.StreamEvent
-
-// errMsg 包装 error 用于 tea.Msg
-type errMsg struct{ err error }
+// agentEventMsg 包装 agent.Event 用于 tea.Msg
+type agentEventMsg agent.Event
 
 // tickMsg 定时触发的消息，用于批量更新
 type tickMsg time.Time
 
-// doneMsg 流式完成后的延迟消息，用于确保最后的流式文本被渲染
+// doneMsg 流式完成后的延迟消息
 type doneMsg struct{}
 
 // New 创建新的 TUI 模型
-func New(providers []config.ProviderConfig) Model {
+func New(providers []config.ProviderConfig, registry *tools.Registry) Model {
 	// 创建 textarea
 	ta := textarea.New()
 	ta.Placeholder = "Send a message..."
@@ -81,11 +81,13 @@ func New(providers []config.ProviderConfig) Model {
 
 	// 如果只有一个 provider，直接使用它；否则进入选择状态
 	var provider llm.Provider
+	var ag *agent.Agent
 	state := stateSelecting
 	if len(providers) == 1 {
 		p, err := llm.New(providers[0])
 		if err == nil {
 			provider = p
+			ag = agent.New(provider, registry)
 			state = stateIdle
 		}
 	}
@@ -97,6 +99,8 @@ func New(providers []config.ProviderConfig) Model {
 		renderer:  renderer,
 		providers: providers,
 		provider:  provider,
+		agent:     ag,
+		registry:  registry,
 		conv:      conversation.New(),
 		curReply:  &strings.Builder{},
 		width:     80,
@@ -119,25 +123,14 @@ func renderTick() tea.Cmd {
 	})
 }
 
-// waitForEvent 读取一个事件并返回 streamMsg
-func waitForEvent(ch <-chan llm.StreamEvent) tea.Cmd {
+// waitForAgentEvent 读取一个 agent 事件并返回 agentEventMsg
+func waitForAgentEvent(ch <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-ch
 		if !ok {
-			return streamMsg{Done: true}
+			return agentEventMsg{Done: true}
 		}
-		return streamMsg(event)
-	}
-}
-
-// waitForErr 读取一个错误并返回 errMsg
-func waitForErr(ch <-chan error) tea.Cmd {
-	return func() tea.Msg {
-		err, ok := <-ch
-		if !ok {
-			return nil
-		}
-		return errMsg{err: err}
+		return agentEventMsg(event)
 	}
 }
 
@@ -185,6 +178,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 				m.provider = provider
+				m.agent = agent.New(provider, m.registry)
 				m.state = stateIdle
 				return m, nil
 			}
@@ -205,8 +199,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 
-				// 检查 provider 是否已初始化
-				if m.provider == nil {
+				// 检查 agent 是否已初始化
+				if m.agent == nil {
 					m.err = fmt.Errorf("no provider selected")
 					return m, tea.Quit
 				}
@@ -220,15 +214,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// 清空输入框
 				m.textarea.Reset()
 
-				// 开始流式请求
+				// 启动 agent 单轮闭环
 				ctx := context.Background()
-				m.events, m.errs = m.provider.Stream(ctx, m.conv.Messages())
+				m.agentEvents = m.agent.Run(ctx, m.conv)
 				m.curReply.Reset()
 				m.turnStart = time.Now()
 				m.state = stateStreaming
 
-				// 启动事件监听、错误监听、spinner 和定时渲染
-				cmds = append(cmds, waitForEvent(m.events), waitForErr(m.errs), m.spinner.Tick, renderTick())
+				// 启动事件监听、spinner 和定时渲染
+				cmds = append(cmds, waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
 				return m, tea.Batch(cmds...)
 			}
 		}
@@ -244,6 +238,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea, cmd = m.textarea.Update(msg)
 		cmds = append(cmds, cmd)
 
+	case tea.PasteMsg:
+		// 粘贴内容传递给 textarea
+		if m.state == stateIdle {
+			var cmd tea.Cmd
+			m.textarea, cmd = m.textarea.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+
 	case spinner.TickMsg:
 		if m.state == stateStreaming {
 			var cmd tea.Cmd
@@ -255,31 +257,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 定时渲染：流式状态下每 50ms 强制重绘一次
 		if m.state == stateStreaming && m.pendingChars > 0 {
 			m.pendingChars = 0
-			// 触发重绘（通过返回 nil Cmd 让 View 重新执行）
 		}
 		if m.state == stateStreaming {
 			cmds = append(cmds, renderTick())
 		}
 
-	case errMsg:
-		// 错误处理
-		m.err = msg.err
-		cmds = append(cmds, tea.Println(fmt.Sprintf("\n❌ Error: %s\n", msg.err.Error())))
-		m.state = stateIdle
-		m.textarea.Focus()
-		return m, tea.Batch(cmds...)
+	case agentEventMsg:
+		// 处理 agent 事件
+		switch {
+		case msg.Err != nil:
+			// 错误处理
+			m.err = msg.Err
+			cmds = append(cmds, tea.Println(fmt.Sprintf("\n❌ Error: %s\n", msg.Err.Error())))
+			m.state = stateIdle
+			m.textarea.Focus()
+			return m, tea.Batch(cmds...)
 
-	case streamMsg:
-		if msg.Done {
-			// 流式完成，但不立即渲染 markdown
-			// 延迟一帧，让 View 有机会渲染完最后的流式文本
+		case msg.Text != "":
+			// 文本增量
+			m.curReply.WriteString(msg.Text)
+			m.pendingChars++
+			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
+
+		case msg.Tool != nil:
+			// 工具事件
+			switch msg.Tool.Phase {
+			case agent.PhaseStart:
+				// 工具开始：展示工具行
+				toolLine := fmt.Sprintf("\n● %s(%s)\n", msg.Tool.Name, msg.Tool.Args)
+				cmds = append(cmds, tea.Println(toolLine))
+			case agent.PhaseEnd:
+				// 工具结束：展示结果摘要
+				resultLine := fmt.Sprintf("  └─ %s\n", msg.Tool.Result)
+				if msg.Tool.IsError {
+					resultLine = fmt.Sprintf("  └─ ❌ %s\n", msg.Tool.Result)
+				}
+				cmds = append(cmds, tea.Println(resultLine))
+			}
+			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
+
+		case msg.Done:
+			// 流式完成
 			m.pendingChars = 0
 			if m.curReply.Len() > 0 {
 				rendered, err := m.renderer.Render(m.curReply.String())
 				if err != nil {
 					rendered = m.curReply.String()
 				}
-				m.conv.AddAssistant(m.curReply.String())
 				elapsed := time.Since(m.turnStart).Seconds()
 				m.pendingMarkdown = fmt.Sprintf("\n%s\n⏱  %.1fs\n", rendered, elapsed)
 			}
@@ -288,16 +312,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return doneMsg{}
 			})
 		}
-
-		// 累积流式内容
-		if msg.Text != "" {
-			m.curReply.WriteString(msg.Text)
-			m.pendingChars++
-			// 不在这里打印，通过 View 渲染
-		}
-
-		// 续读下一个事件
-		cmds = append(cmds, waitForEvent(m.events))
 
 	case doneMsg:
 		// 打印延迟的 markdown

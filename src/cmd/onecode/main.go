@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"onecode/internal/config"
 	"onecode/internal/prompt"
+	"onecode/internal/tools"
 	"onecode/internal/tui"
 )
 
@@ -29,8 +30,17 @@ func main() {
 	// 打印启动横幅
 	fmt.Println(prompt.RenderBanner(version, cwd))
 
+	// 创建工具注册中心
+	registry := tools.NewRegistry()
+	registry.Register(&tools.ReadFileTool{})
+	registry.Register(&tools.WriteFileTool{})
+	registry.Register(&tools.EditFileTool{})
+	registry.Register(&tools.BashTool{})
+	registry.Register(&tools.GlobTool{})
+	registry.Register(&tools.GrepTool{})
+
 	// 创建 TUI 模型
-	model := tui.New(cfg.Providers)
+	model := tui.New(cfg.Providers, registry)
 
 	// 启动 TUI
 	p := tea.NewProgram(model, tea.WithOutput(os.Stderr))

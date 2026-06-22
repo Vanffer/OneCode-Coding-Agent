@@ -2,7 +2,9 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"strings"
 	"time"
 
 	"onecode/internal/config"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/shared"
 )
 
 // openaiStreamIdleTimeout 流式空闲超时
@@ -48,7 +52,7 @@ func (p *openaiProvider) Model() string {
 }
 
 // Stream 发起流式对话
-func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan StreamEvent, <-chan error) {
+func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition) (<-chan StreamEvent, <-chan error) {
 	events := make(chan StreamEvent, 1)
 	errs := make(chan error, 1)
 
@@ -62,9 +66,46 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan Str
 		}
 
 		for _, msg := range msgs {
-			if msg.Role == "user" {
+			if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+				// assistant 消息带工具调用
+				assistantMsg := openai.ChatCompletionAssistantMessageParam{
+					Content: openai.ChatCompletionAssistantMessageParamContentUnion{
+						OfString: param.Opt[string]{
+							Value: msg.Content,
+						},
+					},
+				}
+				for _, tc := range msg.ToolCalls {
+					inputJSON, _ := json.Marshal(tc.Input)
+					assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, openai.ChatCompletionMessageToolCallUnionParam{
+						OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
+							ID: tc.ID,
+							Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
+								Name:      tc.Name,
+								Arguments: string(inputJSON),
+							},
+						},
+					})
+				}
+				messages = append(messages, openai.ChatCompletionMessageParamUnion{
+					OfAssistant: &assistantMsg,
+				})
+			} else if msg.Role == "tool" && msg.ToolResult != nil {
+				// 工具结果
+				toolMsg := openai.ChatCompletionToolMessageParam{
+					ToolCallID: msg.ToolResult.ToolUseID,
+					Content: openai.ChatCompletionToolMessageParamContentUnion{
+						OfString: param.Opt[string]{
+							Value: msg.ToolResult.Content,
+						},
+					},
+				}
+				messages = append(messages, openai.ChatCompletionMessageParamUnion{
+					OfTool: &toolMsg,
+				})
+			} else if msg.Role == "user" {
 				messages = append(messages, openai.UserMessage(msg.Content))
-			} else {
+			} else if msg.Role == "assistant" {
 				messages = append(messages, openai.AssistantMessage(msg.Content))
 			}
 		}
@@ -73,6 +114,34 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan Str
 		params := openai.ChatCompletionNewParams{
 			Model:    p.cfg.Model,
 			Messages: messages,
+		}
+
+		// 注入工具定义
+		if len(tools) > 0 {
+			openaiTools := make([]openai.ChatCompletionToolUnionParam, len(tools))
+			for i, t := range tools {
+				// 空参数归一
+				schema := t.Schema
+				if schema == nil {
+					schema = map[string]interface{}{
+						"type":       "object",
+						"properties": map[string]interface{}{},
+					}
+				}
+
+				openaiTools[i] = openai.ChatCompletionToolUnionParam{
+					OfFunction: &openai.ChatCompletionFunctionToolParam{
+						Function: shared.FunctionDefinitionParam{
+							Name: t.Name,
+							Description: param.Opt[string]{
+								Value: t.Description,
+							},
+							Parameters: shared.FunctionParameters(schema),
+						},
+					},
+				}
+			}
+			params.Tools = openaiTools
 		}
 
 		// 创建流式请求
@@ -93,6 +162,12 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan Str
 			next := stream.Next()
 			nextCh <- sseResult{hasNext: next}
 		}
+
+		// 工具调用状态
+		var toolCallID string
+		var toolCallName string
+		var toolCallArgs strings.Builder
+		inToolCall := false
 
 		go readNext()
 		for {
@@ -123,13 +198,83 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message) (<-chan Str
 			}
 
 			event := stream.Current()
-			if len(event.Choices) > 0 && event.Choices[0].Delta.Content != "" {
+			if len(event.Choices) == 0 {
+				go readNext()
+				continue
+			}
+
+			choice := event.Choices[0]
+
+			// 处理文本增量
+			if choice.Delta.Content != "" {
 				select {
-				case events <- StreamEvent{Text: event.Choices[0].Delta.Content}:
+				case events <- StreamEvent{Text: choice.Delta.Content}:
 					// 写入成功
 				case <-ctx.Done():
 					// 用户取消，立即退出
 					return
+				}
+			}
+
+			// 处理工具调用增量
+			if len(choice.Delta.ToolCalls) > 0 {
+				tc := choice.Delta.ToolCalls[0]
+				if tc.ID != "" {
+					// 新的工具调用开始
+					if inToolCall {
+						// 先吐出之前的工具调用
+						inputJSON := toolCallArgs.String()
+						if inputJSON == "" {
+							inputJSON = "{}"
+						}
+						var input map[string]interface{}
+						if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+							errs <- &LLMError{Message: "工具参数解析失败: " + err.Error()}
+							return
+						}
+						select {
+						case events <- StreamEvent{ToolCall: &ToolCall{
+							ID:    toolCallID,
+							Name:  toolCallName,
+							Input: input,
+						}}:
+						case <-ctx.Done():
+							return
+						}
+					}
+					inToolCall = true
+					toolCallID = tc.ID
+					toolCallName = tc.Function.Name
+					toolCallArgs.Reset()
+				}
+				if tc.Function.Arguments != "" {
+					toolCallArgs.WriteString(tc.Function.Arguments)
+				}
+			}
+
+			// 检查是否结束
+			if choice.FinishReason == "tool_calls" || choice.FinishReason == "stop" {
+				if inToolCall {
+					// 吐出最后一个工具调用
+					inputJSON := toolCallArgs.String()
+					if inputJSON == "" {
+						inputJSON = "{}"
+					}
+					var input map[string]interface{}
+					if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+						errs <- &LLMError{Message: "工具参数解析失败: " + err.Error()}
+						return
+					}
+					select {
+					case events <- StreamEvent{ToolCall: &ToolCall{
+						ID:    toolCallID,
+						Name:  toolCallName,
+						Input: input,
+					}}:
+					case <-ctx.Done():
+						return
+					}
+					inToolCall = false
 				}
 			}
 

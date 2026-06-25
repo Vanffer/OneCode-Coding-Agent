@@ -2,14 +2,18 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"onecode/internal/tools/searchutil"
 )
 
 const (
@@ -17,6 +21,10 @@ const (
 	grepMaxResults = 100
 	// grepMaxLineLength 单行最大长度
 	grepMaxLineLength = 1024 * 1024 // 1MB
+	// grepMaxFileSize 单个文件最大扫描大小
+	grepMaxFileSize = 10 * 1024 * 1024 // 10MB
+	// grepBinaryProbeSize 二进制文件检测读取字节数
+	grepBinaryProbeSize = 8 * 1024
 )
 
 // GrepTool 实现 grep 工具
@@ -29,10 +37,27 @@ type grepArgs struct {
 	Glob    string `json:"glob,omitempty"`
 }
 
+type grepMatch struct {
+	file    string
+	line    int
+	content string
+}
+
+type grepStats struct {
+	skippedUnreadable int
+	skippedBinary     int
+	skippedLarge      int
+	skippedScanError  int
+}
+
 func (t *GrepTool) Name() string { return "grep" }
 
 func (t *GrepTool) Description() string {
-	return "在文件内容中搜索匹配的文本，返回 file:line:content 列表。支持正则表达式。"
+	return `在文件内容中搜索匹配的文本，支持正则表达式。
+适用场景：查找函数定义、搜索代码中的特定文本、定位错误信息。
+不适用：查找文件路径（用 glob）、读取整个文件（用 read_file）。
+返回格式：每行 "文件路径:行号:内容"，最多100个结果。
+配合建议：通常可以使用 grep 定位后，用 read_file 读取上下文。`
 }
 
 func (t *GrepTool) Timeout() time.Duration { return 30 * time.Second }
@@ -51,7 +76,7 @@ func (t *GrepTool) Schema() map[string]interface{} {
 			},
 			"glob": map[string]interface{}{
 				"type":        "string",
-				"description": "文件名过滤模式（可选，如 *.go）",
+				"description": "文件路径过滤 glob（可选，如 **/*.go 或 src/**/*.go）",
 			},
 		},
 		"required": []string{"pattern"},
@@ -78,99 +103,53 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]interface{}) Res
 	if err != nil {
 		return Result{Content: fmt.Sprintf("正则表达式无效: %s", err.Error()), IsError: true}
 	}
+	if a.Glob != "" {
+		if err := searchutil.ValidateGlobPattern(a.Glob); err != nil {
+			return Result{Content: fmt.Sprintf("glob 模式无效: %s", err.Error()), IsError: true}
+		}
+	}
 
 	// 默认路径为当前目录
-	root := a.Path
-	if root == "" {
-		root = "."
+	root := searchutil.NormalizeSearchRoot(a.Path)
+	if err := searchutil.ValidateSearchRoot(root); err != nil {
+		return Result{Content: err.Error(), IsError: true}
 	}
 
-	// 检查根目录是否存在
-	info, err := os.Stat(root)
-	if err != nil {
-		return Result{Content: fmt.Sprintf("路径不存在: %s", root), IsError: true}
-	}
-	if !info.IsDir() {
-		return Result{Content: fmt.Sprintf("路径不是目录: %s", root), IsError: true}
-	}
-
-	// 收集匹配结果
-	type match struct {
-		file    string
-		line    int
-		content string
-	}
-	var matches []match
+	var matches []grepMatch
+	var stats grepStats
 	truncated := false
-	totalMatches := 0
 
-	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // 跳过无法访问的文件
-		}
-
-		// 检查 context
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		// 跳过目录
-		if d.IsDir() {
-			return nil
-		}
-
-		// 文件名过滤
+	skippedUnreadable, err := searchutil.WalkSearchFiles(ctx, root, func(path, relPath string) error {
 		if a.Glob != "" {
-			matched, err := filepath.Match(a.Glob, d.Name())
+			matched, err := searchutil.MatchPattern(a.Glob, relPath)
 			if err != nil || !matched {
 				return nil
 			}
 		}
 
-		// 搜索文件内容
-		file, err := os.Open(path)
+		stop, err := grepFile(ctx, path, re, &matches, &stats)
 		if err != nil {
-			return nil // 跳过无法打开的文件
+			return err
 		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, grepMaxLineLength), grepMaxLineLength)
-
-		lineNum := 0
-		for scanner.Scan() {
-			lineNum++
-			line := scanner.Text()
-
-			if re.MatchString(line) {
-				totalMatches++
-				if len(matches) < grepMaxResults {
-					matches = append(matches, match{
-						file:    path,
-						line:    lineNum,
-						content: line,
-					})
-				} else {
-					truncated = true
-				}
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			return nil // 跳过扫描出错的文件
+		if stop {
+			truncated = true
+			return filepath.SkipAll
 		}
 
 		return nil
 	})
+	stats.skippedUnreadable += skippedUnreadable
 
-	if err != nil && err != context.DeadlineExceeded {
+	if err != nil && err != context.DeadlineExceeded && err != context.Canceled {
 		return Result{Content: fmt.Sprintf("搜索失败: %s", err.Error()), IsError: true}
 	}
 
 	if len(matches) == 0 {
-		return Result{Content: "没有找到匹配的内容", IsError: false}
+		content := "没有找到匹配的内容"
+		if summary := stats.summary(); summary != "" {
+			content += "\n" + summary
+		}
+		return Result{Content: content, IsError: false}
 	}
 
 	// 格式化输出
@@ -180,8 +159,110 @@ func (t *GrepTool) Execute(ctx context.Context, args map[string]interface{}) Res
 	}
 
 	if truncated {
-		result.WriteString(fmt.Sprintf("\n[showing first %d of %d matches]\n", grepMaxResults, totalMatches))
+		result.WriteString(fmt.Sprintf("\n[showing first %d matches; search stopped early]\n", grepMaxResults))
+	}
+	if summary := stats.summary(); summary != "" {
+		result.WriteString(summary)
+		result.WriteString("\n")
 	}
 
 	return Result{Content: result.String(), IsError: false}
+}
+
+func grepFile(ctx context.Context, path string, re *regexp.Regexp, matches *[]grepMatch, stats *grepStats) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		stats.skippedUnreadable++
+		return false, nil
+	}
+	if info.Size() > grepMaxFileSize {
+		stats.skippedLarge++
+		return false, nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		stats.skippedUnreadable++
+		return false, nil
+	}
+	defer file.Close()
+
+	binary, err := isLikelyBinary(file)
+	if err != nil {
+		stats.skippedUnreadable++
+		return false, nil
+	}
+	if binary {
+		stats.skippedBinary++
+		return false, nil
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, grepMaxLineLength), grepMaxLineLength)
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if lineNum%128 == 0 {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			default:
+			}
+		}
+
+		line := scanner.Text()
+		if !re.MatchString(line) {
+			continue
+		}
+
+		*matches = append(*matches, grepMatch{
+			file:    path,
+			line:    lineNum,
+			content: line,
+		})
+		if len(*matches) >= grepMaxResults {
+			return true, nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		stats.skippedScanError++
+		return false, nil
+	}
+
+	return false, nil
+}
+
+func isLikelyBinary(file *os.File) (bool, error) {
+	buf := make([]byte, grepBinaryProbeSize)
+	n, err := file.Read(buf)
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	return bytes.IndexByte(buf[:n], 0) >= 0, nil
+}
+
+func (s grepStats) summary() string {
+	if s.skippedUnreadable == 0 && s.skippedBinary == 0 && s.skippedLarge == 0 && s.skippedScanError == 0 {
+		return ""
+	}
+
+	var parts []string
+	if s.skippedUnreadable > 0 {
+		parts = append(parts, fmt.Sprintf("unreadable=%d", s.skippedUnreadable))
+	}
+	if s.skippedBinary > 0 {
+		parts = append(parts, fmt.Sprintf("binary=%d", s.skippedBinary))
+	}
+	if s.skippedLarge > 0 {
+		parts = append(parts, fmt.Sprintf("large=%d", s.skippedLarge))
+	}
+	if s.skippedScanError > 0 {
+		parts = append(parts, fmt.Sprintf("scan_error=%d", s.skippedScanError))
+	}
+	return "[skipped files: " + strings.Join(parts, ", ") + "]"
 }

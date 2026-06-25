@@ -27,6 +27,6 @@ providers:
 
   - name: DeepSeek
     protocol: openai
-    api_key: YOUR_DEEPSEEK_API_KEY
+    api_key: sk-43f8f798b2064365899389d2b7ad4bcd
     model: deepseek-v4-flash
     base_url: https://api.deepseek.com  # 第三方 API 端点

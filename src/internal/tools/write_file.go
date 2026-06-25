@@ -21,7 +21,11 @@ type writeFileArgs struct {
 func (t *WriteFileTool) Name() string { return "write_file" }
 
 func (t *WriteFileTool) Description() string {
-	return "创建或覆盖文件，自动创建父目录。返回写入的字节数。"
+	return `创建新文件或完全覆盖已有文件，自动创建父目录。
+适用场景：创建新文件、重写整个文件。
+不适用：修改文件中的部分内容（用 edit_file）。
+返回格式：写入的字节数。
+配合建议：先用 read_file 确认当前内容，再决定是否覆盖。`
 }
 
 func (t *WriteFileTool) Timeout() time.Duration { return 30 * time.Second }

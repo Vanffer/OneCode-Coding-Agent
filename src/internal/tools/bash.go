@@ -29,7 +29,11 @@ type bashArgs struct {
 func (t *BashTool) Name() string { return "bash" }
 
 func (t *BashTool) Description() string {
-	return "执行 shell 命令，返回 stdout、stderr 和退出码。支持管道和重定向。"
+	return `执行 shell 命令，返回 stdout、stderr 和退出码。
+适用场景：运行构建命令、执行脚本、查看系统信息、安装依赖。
+不适用：读取文件内容（用 read_file）、搜索文件内容（用 grep）。
+返回格式：stdout + stderr 文本，超长截断；退出码非0表示失败。
+配合建议：如有必要，先用 glob/grep 定位文件，再用 bash 执行相关命令。`
 }
 
 func (t *BashTool) Timeout() time.Duration { return bashTimeout }

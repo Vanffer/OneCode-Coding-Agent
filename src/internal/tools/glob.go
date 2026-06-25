@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"onecode/internal/tools/searchutil"
 )
 
 const (
@@ -28,7 +29,11 @@ type globArgs struct {
 func (t *GlobTool) Name() string { return "glob" }
 
 func (t *GlobTool) Description() string {
-	return "按 glob 模式查找文件，返回匹配的文件路径列表。支持 ** 通配符。"
+	return `按 glob 模式查找文件路径，返回匹配的文件列表。
+适用场景：查找特定类型的文件、定位代码文件、列出目录结构。
+不适用：搜索文件内容（用 grep）、读取文件内容（用 read_file）。
+返回格式：每行一个文件路径，最多100个结果。
+配合建议：用 glob 找到文件后，用 read_file 读取内容。`
 }
 
 func (t *GlobTool) Timeout() time.Duration { return 30 * time.Second }
@@ -64,40 +69,23 @@ func (t *GlobTool) Execute(ctx context.Context, args map[string]interface{}) Res
 	if a.Pattern == "" {
 		return Result{Content: "pattern 参数不能为空", IsError: true}
 	}
+	if err := searchutil.ValidateGlobPattern(a.Pattern); err != nil {
+		return Result{Content: fmt.Sprintf("glob 模式无效: %s", err.Error()), IsError: true}
+	}
 
 	// 默认路径为当前目录
-	root := a.Path
-	if root == "" {
-		root = "."
-	}
-
-	// 检查根目录是否存在
-	info, err := os.Stat(root)
-	if err != nil {
-		return Result{Content: fmt.Sprintf("路径不存在: %s", root), IsError: true}
-	}
-	if !info.IsDir() {
-		return Result{Content: fmt.Sprintf("路径不是目录: %s", root), IsError: true}
+	root := searchutil.NormalizeSearchRoot(a.Path)
+	if err := searchutil.ValidateSearchRoot(root); err != nil {
+		return Result{Content: err.Error(), IsError: true}
 	}
 
 	// 收集匹配的文件
 	var matches []string
 	truncated := false
 
-	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // 跳过无法访问的文件
-		}
-
-		// 检查 context
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
+	_, err = searchutil.WalkSearchFiles(ctx, root, func(path, relPath string) error {
 		// 匹配模式
-		matched, err := matchPattern(a.Pattern, path)
+		matched, err := searchutil.MatchPattern(a.Pattern, relPath)
 		if err != nil {
 			return nil // 跳过匹配错误
 		}
@@ -135,37 +123,4 @@ func (t *GlobTool) Execute(ctx context.Context, args map[string]interface{}) Res
 	}
 
 	return Result{Content: result.String(), IsError: false}
-}
-
-// matchPattern 简化的 glob 匹配，支持 **
-func matchPattern(pattern, path string) (bool, error) {
-	// 使用 filepath.Match 基础匹配
-	// 对于 ** 模式，需要特殊处理
-	if strings.Contains(pattern, "**") {
-		// 简化处理：将 ** 替换为任意路径
-		parts := strings.Split(pattern, "**")
-		if len(parts) == 2 {
-			suffix := parts[1]
-
-			// 检查路径是否匹配 suffix
-			base := filepath.Base(path)
-			// 移除前导分隔符（支持 / 和 \）
-			suffix = strings.TrimPrefix(suffix, "/")
-			suffix = strings.TrimPrefix(suffix, "\\")
-
-			if suffix == "" {
-				return true, nil
-			}
-
-			matched, err := filepath.Match(suffix, base)
-			if err != nil {
-				return false, err
-			}
-			return matched, nil
-		}
-	}
-
-	// 基础匹配
-	base := filepath.Base(path)
-	return filepath.Match(pattern, base)
 }

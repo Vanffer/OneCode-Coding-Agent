@@ -2,6 +2,8 @@ package conversation
 
 import (
 	"testing"
+
+	"onecode/internal/llm"
 )
 
 func TestConversationAddUser(t *testing.T) {
@@ -65,6 +67,63 @@ func TestConversationMultipleMessages(t *testing.T) {
 		if msgs[i].Content != want.content {
 			t.Errorf("message %d: expected content '%s', got '%s'", i, want.content, msgs[i].Content)
 		}
+	}
+}
+
+func TestConversationAddAssistantWithToolCalls(t *testing.T) {
+	conv := New()
+	toolCalls := []llm.ToolCall{
+		{
+			ID:   "call_1",
+			Name: "read_file",
+			Input: map[string]interface{}{
+				"path": "main.go",
+			},
+		},
+		{
+			ID:   "call_2",
+			Name: "grep",
+			Input: map[string]interface{}{
+				"pattern": "func",
+			},
+		},
+	}
+
+	conv.AddAssistantWithToolCalls("I will inspect the files.", toolCalls)
+
+	msgs := conv.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	if msgs[0].Role != "assistant" {
+		t.Errorf("expected role 'assistant', got '%s'", msgs[0].Role)
+	}
+	if msgs[0].Content != "I will inspect the files." {
+		t.Errorf("expected assistant content to be preserved, got %q", msgs[0].Content)
+	}
+	if len(msgs[0].ToolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d", len(msgs[0].ToolCalls))
+	}
+	if msgs[0].ToolCalls[0].ID != "call_1" || msgs[0].ToolCalls[1].ID != "call_2" {
+		t.Fatalf("tool calls were not preserved: %+v", msgs[0].ToolCalls)
+	}
+}
+
+func TestConversationAddAssistantWithToolCallsWithoutContent(t *testing.T) {
+	conv := New()
+	conv.AddAssistantWithToolCalls("", []llm.ToolCall{
+		{ID: "call_1", Name: "read_file", Input: map[string]interface{}{}},
+	})
+
+	msgs := conv.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	if msgs[0].Content != "" {
+		t.Errorf("expected empty content, got %q", msgs[0].Content)
+	}
+	if len(msgs[0].ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(msgs[0].ToolCalls))
 	}
 }
 

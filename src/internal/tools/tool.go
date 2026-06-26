@@ -13,6 +13,20 @@ type Result struct {
 	IsError bool   // true=失败，false=成功
 }
 
+// Safety 描述工具是否只读，供 Agent 决定并发和 Plan Mode 可见范围。
+type Safety int
+
+const (
+	SafetyReadOnly Safety = iota
+	SafetySideEffect
+)
+
+// ToolInfo 保存工具实例及其固定安全分类。
+type ToolInfo struct {
+	Tool   Tool
+	Safety Safety
+}
+
 // Tool 工具接口。每个核心工具实现它。
 type Tool interface {
 	// Name 返回工具名称，如 "read_file"、"bash"

@@ -25,6 +25,15 @@ type ToolResult struct {
 	IsError   bool   // 是否为错误，模型据此决定是否重试
 }
 
+// Usage 表示一次模型响应的 token 用量。
+// Available=false 表示当前 provider 或当前流式响应未提供可靠用量。
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+	TotalTokens  int
+	Available    bool
+}
+
 // Message 表示对话中的一条消息。
 // 扩展后支持三种角色：
 //   - "user"：用户输入，Content 有值
@@ -37,12 +46,25 @@ type Message struct {
 	ToolResult *ToolResult // tool 消息携带的工具结果
 }
 
+// FinishReason 表示一轮模型流式响应结束的大致原因。
+type FinishReason int
+
+const (
+	FinishUnknown FinishReason = iota
+	FinishStop
+	FinishToolCalls
+	FinishLength
+	FinishError
+)
+
 // StreamEvent 流式响应中的一个事件。
-// 文本增量和工具调用互斥——同一事件只会有一个字段非零。
+// 文本增量、工具调用、用量更新和结束事件通常互斥。
 type StreamEvent struct {
-	Text     string    // 文本增量（模型的纯文本输出片段）
-	ToolCall *ToolCall // 工具调用（流式拼接完成后一次性吐出，不是碎片）
-	Done     bool      // 本轮流式结束
+	Text         string       // 文本增量（模型的纯文本输出片段）
+	ToolCall     *ToolCall    // 工具调用（流式拼接完成后一次性吐出，不是碎片）
+	Usage        *Usage       // token 用量更新；不可用时 Available=false
+	Done         bool         // 本轮流式结束
+	FinishReason FinishReason // Done=true 时的结束原因，未知时为 FinishUnknown
 }
 
 // Provider 定义 LLM Provider 的统一接口。

@@ -13,38 +13,58 @@ import (
 // order 保持注册顺序，保证导出的工具列表顺序稳定。
 type Registry struct {
 	order []string
-	tools map[string]Tool
+	tools map[string]ToolInfo
 }
 
 // NewRegistry 创建注册中心
 func NewRegistry() *Registry {
 	return &Registry{
 		order: make([]string, 0),
-		tools: make(map[string]Tool),
+		tools: make(map[string]ToolInfo),
 	}
 }
 
-// Register 注册工具
+// Register 注册工具，并按内置工具名推断安全分类。
 func (r *Registry) Register(t Tool) {
+	r.RegisterWithSafety(t, defaultSafety(t.Name()))
+}
+
+// RegisterWithSafety 注册工具，并显式指定安全分类。
+func (r *Registry) RegisterWithSafety(t Tool, safety Safety) {
 	name := t.Name()
 	if _, exists := r.tools[name]; exists {
 		return // 已注册，跳过
 	}
 	r.order = append(r.order, name)
-	r.tools[name] = t
+	r.tools[name] = ToolInfo{
+		Tool:   t,
+		Safety: safety,
+	}
 }
 
 // Get 按名查找工具
 func (r *Registry) Get(name string) (Tool, bool) {
-	t, ok := r.tools[name]
-	return t, ok
+	info, ok := r.tools[name]
+	if !ok {
+		return nil, false
+	}
+	return info.Tool, true
+}
+
+// Safety 返回工具安全分类。
+func (r *Registry) Safety(name string) (Safety, bool) {
+	info, ok := r.tools[name]
+	if !ok {
+		return SafetySideEffect, false
+	}
+	return info.Safety, true
 }
 
 // List 按注册顺序返回所有工具
 func (r *Registry) List() []Tool {
 	result := make([]Tool, 0, len(r.order))
 	for _, name := range r.order {
-		result = append(result, r.tools[name])
+		result = append(result, r.tools[name].Tool)
 	}
 	return result
 }
@@ -53,7 +73,25 @@ func (r *Registry) List() []Tool {
 func (r *Registry) ToToolDefinitions() []llm.ToolDefinition {
 	result := make([]llm.ToolDefinition, 0, len(r.order))
 	for _, name := range r.order {
-		t := r.tools[name]
+		t := r.tools[name].Tool
+		result = append(result, llm.ToolDefinition{
+			Name:        t.Name(),
+			Description: t.Description(),
+			Schema:      t.Schema(),
+		})
+	}
+	return result
+}
+
+// ToToolDefinitionsBySafety 转成指定安全分类范围内的工具定义列表。
+func (r *Registry) ToToolDefinitionsBySafety(allowed map[Safety]bool) []llm.ToolDefinition {
+	result := make([]llm.ToolDefinition, 0, len(r.order))
+	for _, name := range r.order {
+		info := r.tools[name]
+		if !allowed[info.Safety] {
+			continue
+		}
+		t := info.Tool
 		result = append(result, llm.ToolDefinition{
 			Name:        t.Name(),
 			Description: t.Description(),
@@ -69,13 +107,14 @@ func (r *Registry) ToToolDefinitions() []llm.ToolDefinition {
 // 3. 调用 tool.Execute，捕获 panic 转为 Result
 func (r *Registry) Execute(ctx context.Context, name string, args map[string]interface{}) Result {
 	// 查找工具
-	t, ok := r.tools[name]
+	info, ok := r.tools[name]
 	if !ok {
 		return Result{
 			Content: fmt.Sprintf("工具不存在: %s", name),
 			IsError: true,
 		}
 	}
+	t := info.Tool
 
 	// 创建带超时的 ctx
 	timeout := t.Timeout()
@@ -108,4 +147,14 @@ func (r *Registry) Execute(ctx context.Context, name string, args map[string]int
 	}
 
 	return result
+}
+
+// defaultSafety 为内置工具提供固定安全分类。未知工具保守视为有副作用。
+func defaultSafety(name string) Safety {
+	switch name {
+	case "read_file", "glob", "grep":
+		return SafetyReadOnly
+	default:
+		return SafetySideEffect
+	}
 }

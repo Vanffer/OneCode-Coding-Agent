@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -114,6 +115,9 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 		params := openai.ChatCompletionNewParams{
 			Model:    p.cfg.Model,
 			Messages: messages,
+			StreamOptions: openai.ChatCompletionStreamOptionsParam{
+				IncludeUsage: param.Opt[bool]{Value: true},
+			},
 		}
 
 		// 注入工具定义
@@ -163,11 +167,46 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 			nextCh <- sseResult{hasNext: next}
 		}
 
-		// 工具调用状态
-		var toolCallID string
-		var toolCallName string
-		var toolCallArgs strings.Builder
-		inToolCall := false
+		// 工具调用状态：OpenAI 会按 index 分片返回多个 tool call。
+		type toolCallState struct {
+			id   string
+			name string
+			args strings.Builder
+		}
+		toolCalls := make(map[int64]*toolCallState)
+		toolCallOrder := make([]int64, 0)
+		toolCallsFlushed := false
+		flushToolCalls := func() bool {
+			if toolCallsFlushed || len(toolCalls) == 0 {
+				return true
+			}
+			sort.Slice(toolCallOrder, func(i, j int) bool {
+				return toolCallOrder[i] < toolCallOrder[j]
+			})
+			for _, index := range toolCallOrder {
+				state := toolCalls[index]
+				inputJSON := state.args.String()
+				if inputJSON == "" {
+					inputJSON = "{}"
+				}
+				var input map[string]interface{}
+				if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+					errs <- &LLMError{Message: "工具参数解析失败: " + err.Error()}
+					return false
+				}
+				select {
+				case events <- StreamEvent{ToolCall: &ToolCall{
+					ID:    state.id,
+					Name:  state.name,
+					Input: input,
+				}}:
+				case <-ctx.Done():
+					return false
+				}
+			}
+			toolCallsFlushed = true
+			return true
+		}
 
 		go readNext()
 		for {
@@ -198,6 +237,19 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 			}
 
 			event := stream.Current()
+			if event.Usage.TotalTokens > 0 || event.Usage.PromptTokens > 0 || event.Usage.CompletionTokens > 0 {
+				select {
+				case events <- StreamEvent{Usage: &Usage{
+					InputTokens:  int(event.Usage.PromptTokens),
+					OutputTokens: int(event.Usage.CompletionTokens),
+					TotalTokens:  int(event.Usage.TotalTokens),
+					Available:    true,
+				}}:
+				case <-ctx.Done():
+					return
+				}
+			}
+
 			if len(event.Choices) == 0 {
 				go readNext()
 				continue
@@ -218,67 +270,43 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 
 			// 处理工具调用增量
 			if len(choice.Delta.ToolCalls) > 0 {
-				tc := choice.Delta.ToolCalls[0]
-				if tc.ID != "" {
-					// 新的工具调用开始
-					if inToolCall {
-						// 先吐出之前的工具调用
-						inputJSON := toolCallArgs.String()
-						if inputJSON == "" {
-							inputJSON = "{}"
-						}
-						var input map[string]interface{}
-						if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
-							errs <- &LLMError{Message: "工具参数解析失败: " + err.Error()}
-							return
-						}
-						select {
-						case events <- StreamEvent{ToolCall: &ToolCall{
-							ID:    toolCallID,
-							Name:  toolCallName,
-							Input: input,
-						}}:
-						case <-ctx.Done():
-							return
-						}
+				for _, tc := range choice.Delta.ToolCalls {
+					state, exists := toolCalls[tc.Index]
+					if !exists {
+						state = &toolCallState{}
+						toolCalls[tc.Index] = state
+						toolCallOrder = append(toolCallOrder, tc.Index)
 					}
-					inToolCall = true
-					toolCallID = tc.ID
-					toolCallName = tc.Function.Name
-					toolCallArgs.Reset()
-				}
-				if tc.Function.Arguments != "" {
-					toolCallArgs.WriteString(tc.Function.Arguments)
+					if tc.ID != "" {
+						state.id = tc.ID
+					}
+					if tc.Function.Name != "" {
+						state.name = tc.Function.Name
+					}
+					if tc.Function.Arguments != "" {
+						state.args.WriteString(tc.Function.Arguments)
+					}
 				}
 			}
 
 			// 检查是否结束
-			if choice.FinishReason == "tool_calls" || choice.FinishReason == "stop" {
-				if inToolCall {
-					// 吐出最后一个工具调用
-					inputJSON := toolCallArgs.String()
-					if inputJSON == "" {
-						inputJSON = "{}"
-					}
-					var input map[string]interface{}
-					if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
-						errs <- &LLMError{Message: "工具参数解析失败: " + err.Error()}
-						return
-					}
-					select {
-					case events <- StreamEvent{ToolCall: &ToolCall{
-						ID:    toolCallID,
-						Name:  toolCallName,
-						Input: input,
-					}}:
-					case <-ctx.Done():
-						return
-					}
-					inToolCall = false
+			if choice.FinishReason != "" {
+				if !flushToolCalls() {
+					return
 				}
+				select {
+				case events <- StreamEvent{Done: true, FinishReason: mapOpenAIFinishReason(choice.FinishReason)}:
+				case <-ctx.Done():
+					return
+				}
+				return
 			}
 
 			go readNext()
+		}
+
+		if !flushToolCalls() {
+			return
 		}
 
 		// 检查错误
@@ -295,7 +323,7 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 
 		// 正常结束
 		select {
-		case events <- StreamEvent{Done: true}:
+		case events <- StreamEvent{Done: true, FinishReason: FinishUnknown}:
 			// 写入成功
 		case <-ctx.Done():
 			// 用户取消，立即退出
@@ -304,4 +332,17 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 	}()
 
 	return events, errs
+}
+
+func mapOpenAIFinishReason(reason string) FinishReason {
+	switch reason {
+	case "stop":
+		return FinishStop
+	case "tool_calls", "function_call":
+		return FinishToolCalls
+	case "length":
+		return FinishLength
+	default:
+		return FinishUnknown
+	}
 }

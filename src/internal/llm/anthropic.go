@@ -155,6 +155,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 		var toolUseName string
 		var toolUseJSON strings.Builder
 		inToolUse := false
+		finishReason := FinishUnknown
 
 		go readNext()
 		for {
@@ -184,6 +185,24 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 
 			event := stream.Current()
 			switch variant := event.AsAny().(type) {
+			case anthropic.MessageDeltaEvent:
+				finishReason = mapAnthropicFinishReason(variant.Delta.StopReason)
+				if variant.Usage.InputTokens > 0 || variant.Usage.OutputTokens > 0 ||
+					variant.Usage.CacheCreationInputTokens > 0 || variant.Usage.CacheReadInputTokens > 0 {
+					inputTokens := variant.Usage.InputTokens + variant.Usage.CacheCreationInputTokens + variant.Usage.CacheReadInputTokens
+					totalTokens := inputTokens + variant.Usage.OutputTokens
+					select {
+					case events <- StreamEvent{Usage: &Usage{
+						InputTokens:  int(inputTokens),
+						OutputTokens: int(variant.Usage.OutputTokens),
+						TotalTokens:  int(totalTokens),
+						Available:    true,
+					}}:
+					case <-ctx.Done():
+						return
+					}
+				}
+
 			case anthropic.ContentBlockStartEvent:
 				// 检查是否是 tool_use 块
 				if variant.ContentBlock.Type == "tool_use" {
@@ -262,7 +281,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 
 		// 正常结束
 		select {
-		case events <- StreamEvent{Done: true}:
+		case events <- StreamEvent{Done: true, FinishReason: finishReason}:
 			// 写入成功
 		case <-ctx.Done():
 			// 用户取消，立即退出
@@ -271,4 +290,17 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 	}()
 
 	return events, errs
+}
+
+func mapAnthropicFinishReason(reason anthropic.StopReason) FinishReason {
+	switch reason {
+	case anthropic.StopReasonEndTurn, anthropic.StopReasonStopSequence:
+		return FinishStop
+	case anthropic.StopReasonToolUse:
+		return FinishToolCalls
+	case anthropic.StopReasonMaxTokens:
+		return FinishLength
+	default:
+		return FinishUnknown
+	}
 }

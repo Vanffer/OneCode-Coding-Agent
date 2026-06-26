@@ -32,12 +32,12 @@ func main() {
 
 	// 创建工具注册中心
 	registry := tools.NewRegistry()
-	registry.Register(&tools.ReadFileTool{})
-	registry.Register(&tools.WriteFileTool{})
-	registry.Register(&tools.EditFileTool{})
-	registry.Register(&tools.BashTool{})
-	registry.Register(&tools.GlobTool{})
-	registry.Register(&tools.GrepTool{})
+	registry.RegisterWithSafety(&tools.ReadFileTool{}, tools.SafetyReadOnly)
+	registry.RegisterWithSafety(&tools.WriteFileTool{}, tools.SafetySideEffect)
+	registry.RegisterWithSafety(&tools.EditFileTool{}, tools.SafetySideEffect)
+	registry.RegisterWithSafety(&tools.BashTool{}, tools.SafetySideEffect)
+	registry.RegisterWithSafety(&tools.GlobTool{}, tools.SafetyReadOnly)
+	registry.RegisterWithSafety(&tools.GrepTool{}, tools.SafetyReadOnly)
 
 	// 创建 TUI 模型
 	model := tui.New(cfg.Providers, registry)

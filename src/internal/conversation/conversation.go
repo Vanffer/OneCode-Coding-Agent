@@ -30,9 +30,11 @@ func (c *Conversation) AddAssistant(text string) {
 	})
 }
 
-// AddAssistantWithToolCalls 添加带工具调用的助手消息
-func (c *Conversation) AddAssistantWithToolCalls(toolCalls []llm.ToolCall) {
+// AddAssistantWithToolCalls 添加带工具调用的助手消息。
+// content 保存模型在工具调用前输出的可见文本，toolCalls 保存同一轮的全部工具调用。
+func (c *Conversation) AddAssistantWithToolCalls(content string, toolCalls []llm.ToolCall) {
 	c.messages = append(c.messages, llm.Message{
+		Content:   content,
 		Role:      "assistant",
 		ToolCalls: toolCalls,
 	})

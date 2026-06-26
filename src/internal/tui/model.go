@@ -40,6 +40,10 @@ type Model struct {
 	registry        *tools.Registry
 	conv            *conversation.Conversation
 	agentEvents     <-chan agent.Event // 当前 agent 事件
+	cancelCurrent   context.CancelFunc // 当前 agent run 的取消函数
+	pendingPlan     *PendingPlan       // /plan 生成、/do 消费的待执行计划
+	currentMode     agent.Mode         // 当前运行模式
+	progressStatus  string             // Agent 进度状态栏文案
 	curReply        *strings.Builder   // 本轮 assistant 增量缓冲
 	pendingChars    int                // 待渲染字符数（用于批量更新）
 	pendingMarkdown string             // 待打印的 markdown
@@ -47,6 +51,13 @@ type Model struct {
 	width, height   int
 	ready           bool  // 界面是否已初始化
 	err             error // 错误信息
+}
+
+// PendingPlan 保存 /plan 生成的待执行计划，仅保留在当前进程内存中。
+type PendingPlan struct {
+	Content   string
+	CreatedAt time.Time
+	Consumed  bool
 }
 
 // agentEventMsg 包装 agent.Event 用于 tea.Msg
@@ -128,7 +139,10 @@ func waitForAgentEvent(ch <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-ch
 		if !ok {
-			return agentEventMsg{Done: true}
+			return agentEventMsg{
+				Type: agent.EventDone,
+				Done: &agent.DoneEvent{Reason: agent.StopModelDone},
+			}
 		}
 		return agentEventMsg(event)
 	}
@@ -205,31 +219,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 
-				// 添加用户消息
-				m.conv.AddUser(input)
-
 				// 提交用户消息到 scrollback
 				cmds = append(cmds, tea.Println(fmt.Sprintf("\n❯ %s\n", input)))
 
 				// 清空输入框
 				m.textarea.Reset()
 
-				// 启动 agent 单轮闭环
-				ctx := context.Background()
-				m.agentEvents = m.agent.Run(ctx, m.conv)
-				m.curReply.Reset()
-				m.turnStart = time.Now()
-				m.state = stateStreaming
+				if next, cmd, handled := m.handleSlashCommand(input); handled {
+					m = next
+					cmds = append(cmds, cmd)
+					return m, tea.Batch(cmds...)
+				}
 
-				// 启动事件监听、spinner 和定时渲染
-				cmds = append(cmds, waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+				next, cmd := m.startAgentRun(input, agent.ModeExecute, agent.RunOptions{Mode: agent.ModeExecute})
+				m = next
+				cmds = append(cmds, cmd)
 				return m, tea.Batch(cmds...)
 			}
 		}
 
 		// 处理流式状态的按键
 		if m.state == stateStreaming {
-			// 流式状态下不处理输入
+			if msg.String() == "esc" {
+				next, cmd := m.cancelAgentRun()
+				return next, cmd
+			}
 			return m, nil
 		}
 
@@ -264,30 +278,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentEventMsg:
 		// 处理 agent 事件
-		switch {
-		case msg.Err != nil:
+		switch msg.Type {
+		case agent.EventError:
 			// 错误处理
-			m.err = msg.Err
-			cmds = append(cmds, tea.Println(fmt.Sprintf("\n❌ Error: %s\n", msg.Err.Error())))
+			if msg.Err != nil {
+				cmds = append(cmds, tea.Println(fmt.Sprintf("\n❌ Error: %s\n", msg.Err.Error())))
+			}
+			if m.pendingPlan != nil && m.pendingPlan.Consumed {
+				m.pendingPlan = nil
+			}
+			m.cancelCurrent = nil
 			m.state = stateIdle
 			m.textarea.Focus()
 			return m, tea.Batch(cmds...)
 
-		case msg.Text != "":
+		case agent.EventText:
 			// 文本增量
 			m.curReply.WriteString(msg.Text)
 			m.pendingChars++
 			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
 
-		case msg.Tool != nil:
+		case agent.EventToolStart:
 			// 工具事件
-			switch msg.Tool.Phase {
-			case agent.PhaseStart:
-				// 工具开始：展示工具行
+			if msg.Tool != nil {
 				toolLine := fmt.Sprintf("\n● %s(%s)\n", msg.Tool.Name, msg.Tool.Args)
 				cmds = append(cmds, tea.Println(toolLine))
-			case agent.PhaseEnd:
-				// 工具结束：展示结果摘要
+			}
+			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
+
+		case agent.EventToolResult:
+			if msg.Tool != nil {
 				resultLine := fmt.Sprintf("  └─ %s\n", msg.Tool.Result)
 				if msg.Tool.IsError {
 					resultLine = fmt.Sprintf("  └─ ❌ %s\n", msg.Tool.Result)
@@ -296,9 +316,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
 
-		case msg.Done:
+		case agent.EventProgress:
+			if msg.Progress != nil {
+				m.progressStatus = msg.Progress.Message
+			}
+			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
+
+		case agent.EventUsage:
+			// 用量事件目前只更新状态，不额外打印；不可用时不显示伪造数字。
+			if msg.Usage != nil && msg.Usage.Available {
+				m.progressStatus = fmt.Sprintf("tokens %d", msg.Usage.TotalTokens)
+			}
+			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
+
+		case agent.EventCancelled:
+			m.progressStatus = "Cancelled"
+			cmds = append(cmds, tea.Println("\n任务已取消"))
+			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
+
+		case agent.EventDone:
 			// 流式完成
 			m.pendingChars = 0
+			if m.currentMode == agent.ModePlan && msg.Done != nil && msg.Done.Reason == agent.StopModelDone && m.curReply.Len() > 0 {
+				m.pendingPlan = &PendingPlan{
+					Content:   m.curReply.String(),
+					CreatedAt: time.Now(),
+				}
+			}
+			if m.pendingPlan != nil && m.pendingPlan.Consumed {
+				m.pendingPlan = nil
+			}
+			m.cancelCurrent = nil
+			m.progressStatus = ""
 			if m.curReply.Len() > 0 {
 				rendered, err := m.renderer.Render(m.curReply.String())
 				if err != nil {
@@ -325,6 +374,59 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m Model) handleSlashCommand(input string) (Model, tea.Cmd, bool) {
+	if !strings.HasPrefix(input, "/") {
+		return m, nil, false
+	}
+
+	switch {
+	case input == "/exit":
+		return m, tea.Quit, true
+
+	case strings.HasPrefix(input, "/plan"):
+		target := strings.TrimSpace(strings.TrimPrefix(input, "/plan"))
+		if target == "" {
+			return m, tea.Println("\n请输入要规划的目标，例如 /plan 优化 grep 工具"), true
+		}
+		planPrompt := "Plan mode: inspect the codebase using read-only tools only, then produce an implementation plan. Do not modify files or run side-effect tools.\n\nGoal:\n" + target
+		next, cmd := m.startAgentRun(planPrompt, agent.ModePlan, agent.RunOptions{Mode: agent.ModePlan})
+		return next, cmd, true
+
+	case input == "/do":
+		if m.pendingPlan == nil || m.pendingPlan.Content == "" {
+			return m, tea.Println("\n没有待执行计划，请先使用 /plan 生成计划。"), true
+		}
+		doPrompt := "Execute the pending plan below. Use tools as needed, report actual changes and verification results when complete.\n\n" + m.pendingPlan.Content
+		m.pendingPlan.Consumed = true
+		next, cmd := m.startAgentRun(doPrompt, agent.ModeExecute, agent.RunOptions{Mode: agent.ModeExecute})
+		return next, cmd, true
+	}
+
+	return m, tea.Println(fmt.Sprintf("\n未知命令: %s", input)), true
+}
+
+func (m Model) startAgentRun(input string, mode agent.Mode, opts agent.RunOptions) (Model, tea.Cmd) {
+	m.conv.AddUser(input)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelCurrent = cancel
+	m.currentMode = mode
+	m.progressStatus = ""
+	m.agentEvents = m.agent.Run(ctx, m.conv, opts)
+	m.curReply.Reset()
+	m.turnStart = time.Now()
+	m.state = stateStreaming
+
+	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+}
+
+func (m Model) cancelAgentRun() (Model, tea.Cmd) {
+	if m.cancelCurrent != nil {
+		m.cancelCurrent()
+		m.progressStatus = "Cancelling"
+	}
+	return m, nil
 }
 
 // View 渲染视图
@@ -383,6 +485,9 @@ func (m Model) viewStreaming() string {
 	// 状态栏
 	elapsed := time.Since(m.turnStart).Seconds()
 	status := fmt.Sprintf("%s %.1fs", m.spinner.View(), elapsed)
+	if m.progressStatus != "" {
+		status = fmt.Sprintf("%s %s %.1fs", m.spinner.View(), m.progressStatus, elapsed)
+	}
 	s.WriteString(statusBar(m.provider, status, m.width))
 	s.WriteString("\n")
 

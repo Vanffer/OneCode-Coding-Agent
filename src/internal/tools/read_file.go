@@ -36,6 +36,7 @@ func (t *ReadFileTool) Description() string {
 适用场景：查看代码、读取配置文件、检查文件内容。
 不适用：搜索文件中的特定内容（用 grep）、查找文件路径（用 glob）。
 返回格式：每行 "行号\t内容"，超过 limit 时截断并提示 offset。
+关键规则：涉及代码或文件时，优先用 read_file 读取真实上下文；编辑已有文件前必须先读取相关内容。
 配合建议：先用 glob 找到文件路径，再用 read_file 读取内容。`
 }
 

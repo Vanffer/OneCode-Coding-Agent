@@ -13,6 +13,15 @@ type RunOptions struct {
 	Mode                   Mode
 	MaxIterations          int
 	MaxConsecutiveBadTools int
+	ReminderInterval       int
+}
+
+// String returns the prompt-runtime mode name.
+func (m Mode) String() string {
+	if m == ModePlan {
+		return "plan"
+	}
+	return "execute"
 }
 
 // EventType 标识 Agent 对外事件类型。
@@ -51,10 +60,13 @@ type ToolEvent struct {
 
 // UsageEvent 表示 token 用量更新。
 type UsageEvent struct {
-	InputTokens  int
-	OutputTokens int
-	TotalTokens  int
-	Available    bool
+	InputTokens              int
+	OutputTokens             int
+	TotalTokens              int
+	Available                bool
+	CacheAvailable           bool
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
 }
 
 // ProgressStatus 表示 Agent loop 当前阶段。

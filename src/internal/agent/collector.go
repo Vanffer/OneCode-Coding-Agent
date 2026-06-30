@@ -62,10 +62,13 @@ func (a *Agent) collectModelResponse(
 				if !sendEvent(ctx, events, Event{
 					Type: EventUsage,
 					Usage: &UsageEvent{
-						InputTokens:  response.Usage.InputTokens,
-						OutputTokens: response.Usage.OutputTokens,
-						TotalTokens:  response.Usage.TotalTokens,
-						Available:    response.Usage.Available,
+						InputTokens:              response.Usage.InputTokens,
+						OutputTokens:             response.Usage.OutputTokens,
+						TotalTokens:              response.Usage.TotalTokens,
+						Available:                response.Usage.Available,
+						CacheAvailable:           response.Usage.Cache.Available,
+						CacheCreationInputTokens: response.Usage.Cache.CreationInputTokens,
+						CacheReadInputTokens:     response.Usage.Cache.ReadInputTokens,
 					},
 				}) {
 					return response, ctx.Err()

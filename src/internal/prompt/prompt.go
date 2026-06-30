@@ -9,9 +9,6 @@ import (
 //go:embed banner.txt
 var dogAndText string
 
-//go:embed system.txt
-var SystemPrompt string
-
 // ANSI 颜色代码（彩虹渐变）
 var gradientColors = []string{
 	"\033[38;5;196m", // 红

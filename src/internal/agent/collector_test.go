@@ -15,7 +15,17 @@ func TestCollectModelResponse(t *testing.T) {
 
 	stream <- llm.StreamEvent{Text: "hello "}
 	stream <- llm.StreamEvent{ToolCall: &llm.ToolCall{ID: "call_1", Name: "read_file", Input: map[string]interface{}{"path": "main.go"}}}
-	stream <- llm.StreamEvent{Usage: &llm.Usage{InputTokens: 3, OutputTokens: 5, TotalTokens: 8, Available: true}}
+	stream <- llm.StreamEvent{Usage: &llm.Usage{
+		InputTokens:  3,
+		OutputTokens: 5,
+		TotalTokens:  15,
+		Available:    true,
+		Cache: llm.CacheUsage{
+			Available:           true,
+			CreationInputTokens: 4,
+			ReadInputTokens:     3,
+		},
+	}}
 	stream <- llm.StreamEvent{Text: "world"}
 	stream <- llm.StreamEvent{Done: true, FinishReason: llm.FinishToolCalls}
 	close(stream)
@@ -34,28 +44,35 @@ func TestCollectModelResponse(t *testing.T) {
 	if response.ToolCalls[0].ID != "call_1" {
 		t.Fatalf("expected call_1, got %q", response.ToolCalls[0].ID)
 	}
-	if !response.Usage.Available || response.Usage.TotalTokens != 8 {
-		t.Fatalf("expected available usage with total 8, got %+v", response.Usage)
+	if !response.Usage.Available || response.Usage.TotalTokens != 15 {
+		t.Fatalf("expected available usage with total 15, got %+v", response.Usage)
+	}
+	if !response.Usage.Cache.Available || response.Usage.Cache.CreationInputTokens != 4 || response.Usage.Cache.ReadInputTokens != 3 {
+		t.Fatalf("expected cache usage to be preserved, got %+v", response.Usage.Cache)
 	}
 	if response.FinishReason != llm.FinishToolCalls {
 		t.Fatalf("expected FinishToolCalls, got %v", response.FinishReason)
 	}
 
-	var sawText, sawUsage bool
+	var sawText bool
+	var usage *UsageEvent
 	for len(events) > 0 {
 		event := <-events
 		switch event.Type {
 		case EventText:
 			sawText = true
 		case EventUsage:
-			sawUsage = true
+			usage = event.Usage
 		}
 	}
 	if !sawText {
 		t.Fatal("expected text event")
 	}
-	if !sawUsage {
+	if usage == nil {
 		t.Fatal("expected usage event")
+	}
+	if !usage.CacheAvailable || usage.CacheCreationInputTokens != 4 || usage.CacheReadInputTokens != 3 {
+		t.Fatalf("expected usage event to include cache fields, got %+v", usage)
 	}
 }
 

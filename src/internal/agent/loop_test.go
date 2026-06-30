@@ -7,6 +7,7 @@ import (
 
 	"onecode/internal/conversation"
 	"onecode/internal/llm"
+	"onecode/internal/prompt"
 	"onecode/internal/tools"
 )
 
@@ -19,6 +20,7 @@ type streamScript struct {
 type providerCall struct {
 	messages []llm.Message
 	tools    []llm.ToolDefinition
+	prompt   prompt.Payload
 }
 
 type scriptedProvider struct {
@@ -31,14 +33,14 @@ type scriptedProvider struct {
 func (p *scriptedProvider) Name() string  { return "mock" }
 func (p *scriptedProvider) Model() string { return "mock-model" }
 
-func (p *scriptedProvider) Stream(ctx context.Context, msgs []llm.Message, toolDefs []llm.ToolDefinition) (<-chan llm.StreamEvent, <-chan error) {
+func (p *scriptedProvider) Stream(ctx context.Context, msgs []llm.Message, toolDefs []llm.ToolDefinition, opts llm.StreamOptions) (<-chan llm.StreamEvent, <-chan error) {
 	p.mu.Lock()
 	index := len(p.calls)
 	copiedMsgs := make([]llm.Message, len(msgs))
 	copy(copiedMsgs, msgs)
 	copiedTools := make([]llm.ToolDefinition, len(toolDefs))
 	copy(copiedTools, toolDefs)
-	p.calls = append(p.calls, providerCall{messages: copiedMsgs, tools: copiedTools})
+	p.calls = append(p.calls, providerCall{messages: copiedMsgs, tools: copiedTools, prompt: opts.Prompt})
 	if p.callCh != nil {
 		select {
 		case p.callCh <- struct{}{}:
@@ -189,6 +191,71 @@ func TestLoopCancelStopsNextProviderCall(t *testing.T) {
 	}
 }
 
+func TestAgentPassesPromptPayload(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{
+			{Text: "done"},
+			{Done: true, FinishReason: llm.FinishStop},
+		}},
+	}}
+	agent := New(provider, tools.NewRegistry())
+
+	drainEvents(agent.Run(context.Background(), conversation.New(), RunOptions{Mode: ModeExecute}))
+
+	call := provider.callAt(0)
+	if call.prompt.StableSystem == "" {
+		t.Fatal("expected stable system prompt")
+	}
+	if len(call.prompt.Reminders) != 1 {
+		t.Fatalf("expected environment reminder, got %d reminders", len(call.prompt.Reminders))
+	}
+	if call.prompt.Reminders[0].Kind != prompt.ReminderEnvironment {
+		t.Fatalf("expected environment reminder, got %q", call.prompt.Reminders[0].Kind)
+	}
+}
+
+func TestPromptRemindersDoNotEnterConversation(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{
+			{Text: "plan"},
+			{Done: true, FinishReason: llm.FinishStop},
+		}},
+	}}
+	agent := New(provider, tools.NewRegistry())
+	conv := conversation.New()
+	conv.AddUser("make a plan")
+
+	drainEvents(agent.Run(context.Background(), conv, RunOptions{Mode: ModePlan}))
+
+	for _, msg := range conv.Messages() {
+		if msg.Role == "system" || msg.Content == "<system-reminder>" {
+			t.Fatalf("conversation should not contain system reminders: %+v", conv.Messages())
+		}
+		if msg.Content != "" && containsSystemReminder(msg.Content) {
+			t.Fatalf("conversation should not contain system reminder content: %+v", msg)
+		}
+	}
+}
+
+func TestPromptPayloadByMode(t *testing.T) {
+	executeProvider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{{Done: true, FinishReason: llm.FinishStop}}},
+	}}
+	planProvider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{{Done: true, FinishReason: llm.FinishStop}}},
+	}}
+
+	drainEvents(New(executeProvider, tools.NewRegistry()).Run(context.Background(), conversation.New(), RunOptions{Mode: ModeExecute}))
+	drainEvents(New(planProvider, tools.NewRegistry()).Run(context.Background(), conversation.New(), RunOptions{Mode: ModePlan}))
+
+	if hasReminderKind(executeProvider.callAt(0).prompt, prompt.ReminderPlanMode) {
+		t.Fatalf("execute mode should not include plan reminder: %+v", executeProvider.callAt(0).prompt.Reminders)
+	}
+	if !hasReminderKind(planProvider.callAt(0).prompt, prompt.ReminderPlanMode) {
+		t.Fatalf("plan mode should include plan reminder: %+v", planProvider.callAt(0).prompt.Reminders)
+	}
+}
+
 func drainEvents(ch <-chan Event) []Event {
 	var events []Event
 	for event := range ch {
@@ -204,4 +271,18 @@ func lastDone(events []Event) *DoneEvent {
 		}
 	}
 	return nil
+}
+
+func hasReminderKind(payload prompt.Payload, kind prompt.ReminderKind) bool {
+	for _, reminder := range payload.Reminders {
+		if reminder.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSystemReminder(content string) bool {
+	return len(content) >= len("<system-reminder>") && (content == "<system-reminder>" ||
+		content[:len("<system-reminder>")] == "<system-reminder>")
 }

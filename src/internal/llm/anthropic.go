@@ -11,7 +11,6 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"onecode/internal/config"
-	"onecode/internal/prompt"
 )
 
 // anthropicStreamIdleTimeout 流式空闲超时
@@ -50,7 +49,7 @@ func (p *anthropicProvider) Model() string {
 }
 
 // Stream 发起流式对话
-func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition) (<-chan StreamEvent, <-chan error) {
+func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition, opts StreamOptions) (<-chan StreamEvent, <-chan error) {
 	events := make(chan StreamEvent, 1)
 	errs := make(chan error, 1)
 
@@ -85,13 +84,25 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 		}
 
 		// 构建请求参数
+		systemBlocks := make([]anthropic.TextBlockParam, 0, len(opts.Prompt.Reminders)+1)
+		if opts.Prompt.StableSystem != "" {
+			systemBlocks = append(systemBlocks, anthropic.TextBlockParam{
+				Text:         opts.Prompt.StableSystem,
+				CacheControl: anthropic.NewCacheControlEphemeralParam(),
+			})
+		}
+		for _, reminder := range opts.Prompt.Reminders {
+			if reminder.Content == "" {
+				continue
+			}
+			systemBlocks = append(systemBlocks, anthropic.TextBlockParam{Text: reminder.Content})
+		}
+
 		params := anthropic.MessageNewParams{
 			Model:     p.cfg.Model,
 			MaxTokens: 4096,
-			System: []anthropic.TextBlockParam{
-				{Text: prompt.SystemPrompt},
-			},
-			Messages: messages,
+			System:    systemBlocks,
+			Messages:  messages,
 		}
 
 		// 注入工具定义
@@ -116,6 +127,9 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 				anthropicTools[i] = anthropic.ToolUnionParam{
 					OfTool: &toolParam,
 				}
+			}
+			if len(anthropicTools) > 0 {
+				anthropicTools[len(anthropicTools)-1].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
 			}
 			params.Tools = anthropicTools
 
@@ -189,14 +203,21 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 				finishReason = mapAnthropicFinishReason(variant.Delta.StopReason)
 				if variant.Usage.InputTokens > 0 || variant.Usage.OutputTokens > 0 ||
 					variant.Usage.CacheCreationInputTokens > 0 || variant.Usage.CacheReadInputTokens > 0 {
-					inputTokens := variant.Usage.InputTokens + variant.Usage.CacheCreationInputTokens + variant.Usage.CacheReadInputTokens
-					totalTokens := inputTokens + variant.Usage.OutputTokens
+					inputTokens := variant.Usage.InputTokens
+					cacheCreationTokens := variant.Usage.CacheCreationInputTokens
+					cacheReadTokens := variant.Usage.CacheReadInputTokens
+					totalTokens := inputTokens + cacheCreationTokens + cacheReadTokens + variant.Usage.OutputTokens
 					select {
 					case events <- StreamEvent{Usage: &Usage{
 						InputTokens:  int(inputTokens),
 						OutputTokens: int(variant.Usage.OutputTokens),
 						TotalTokens:  int(totalTokens),
 						Available:    true,
+						Cache: CacheUsage{
+							Available:           true,
+							CreationInputTokens: int(cacheCreationTokens),
+							ReadInputTokens:     int(cacheReadTokens),
+						},
 					}}:
 					case <-ctx.Done():
 						return

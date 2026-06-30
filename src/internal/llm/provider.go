@@ -1,6 +1,10 @@
 package llm
 
-import "context"
+import (
+	"context"
+
+	"onecode/internal/prompt"
+)
 
 // ToolDefinition 工具定义，发给 LLM API 让模型知道有哪些工具可用。
 // 协议无关，由 Registry.ToToolDefinitions() 生成。
@@ -25,6 +29,14 @@ type ToolResult struct {
 	IsError   bool   // 是否为错误，模型据此决定是否重试
 }
 
+// CacheUsage 表示 prompt cache 相关 token 用量。
+// Available=false 表示当前 provider 未提供缓存字段。
+type CacheUsage struct {
+	Available           bool
+	CreationInputTokens int
+	ReadInputTokens     int
+}
+
 // Usage 表示一次模型响应的 token 用量。
 // Available=false 表示当前 provider 或当前流式响应未提供可靠用量。
 type Usage struct {
@@ -32,6 +44,7 @@ type Usage struct {
 	OutputTokens int
 	TotalTokens  int
 	Available    bool
+	Cache        CacheUsage
 }
 
 // Message 表示对话中的一条消息。
@@ -67,6 +80,11 @@ type StreamEvent struct {
 	FinishReason FinishReason // Done=true 时的结束原因，未知时为 FinishUnknown
 }
 
+// StreamOptions 是一轮模型请求的扩展选项。
+type StreamOptions struct {
+	Prompt prompt.Payload
+}
+
 // Provider 定义 LLM Provider 的统一接口。
 // Stream 新增 tools 参数：传入工具定义列表，模型据此决定是否调用工具。
 type Provider interface {
@@ -75,9 +93,9 @@ type Provider interface {
 	// Model 返回模型名称，用于状态栏右侧显示
 	Model() string
 	// Stream 发起一轮流式对话
-	// 内部注入内置 system prompt 与 thinking 配置；思考增量内部丢弃
+	// opts.Prompt 提供稳定 system prompt 与运行时系统提醒；思考增量内部丢弃
 	// tools 为工具定义列表，传 nil 表示不使用工具
 	// events 吐出文本增量、工具调用和结束信号；errs 吐出错误（与 events 互斥）
 	// ctx 取消即终止；两个 channel 都由实现方关闭
-	Stream(ctx context.Context, msgs []Message, tools []ToolDefinition) (<-chan StreamEvent, <-chan error)
+	Stream(ctx context.Context, msgs []Message, tools []ToolDefinition, opts StreamOptions) (<-chan StreamEvent, <-chan error)
 }

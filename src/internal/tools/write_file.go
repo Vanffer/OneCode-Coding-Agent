@@ -25,7 +25,8 @@ func (t *WriteFileTool) Description() string {
 适用场景：创建新文件、重写整个文件。
 不适用：修改文件中的部分内容（用 edit_file）。
 返回格式：写入的字节数。
-配合建议：先用 read_file 确认当前内容，再决定是否覆盖。`
+关键规则：write_file 有文件副作用；覆盖已有文件前必须先用 read_file 确认当前内容，除非用户明确要求覆盖。
+配合建议：局部修改优先使用 edit_file。`
 }
 
 func (t *WriteFileTool) Timeout() time.Duration { return 30 * time.Second }

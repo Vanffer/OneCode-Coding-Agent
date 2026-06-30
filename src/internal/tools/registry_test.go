@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,5 +111,30 @@ func TestRegistryUnknownSafety(t *testing.T) {
 	}
 	if safety != SafetySideEffect {
 		t.Fatalf("expected conservative side-effect safety, got %v", safety)
+	}
+}
+
+func TestBuiltInToolDescriptionsReinforcePromptRules(t *testing.T) {
+	tests := []struct {
+		tool Tool
+		want []string
+	}{
+		{&ReadFileTool{}, []string{"读取真实上下文", "编辑已有文件前必须先读取"}},
+		{&EditFileTool{}, []string{"编辑已有文件前必须先用 read_file", "工具失败时阅读错误"}},
+		{&WriteFileTool{}, []string{"write_file 有文件副作用", "覆盖已有文件前必须先用 read_file"}},
+		{&GlobTool{}, []string{"查找文件路径时优先使用 glob"}},
+		{&GrepTool{}, []string{"搜索文件内容时优先使用 grep", "glob 参数限制"}},
+		{&BashTool{}, []string{"bash 可能有副作用", "优先使用专用工具"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tool.Name(), func(t *testing.T) {
+			description := tt.tool.Description()
+			for _, want := range tt.want {
+				if !strings.Contains(description, want) {
+					t.Fatalf("description for %s should contain %q, got:\n%s", tt.tool.Name(), want, description)
+				}
+			}
+		})
 	}
 }

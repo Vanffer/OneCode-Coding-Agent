@@ -326,6 +326,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// 用量事件目前只更新状态，不额外打印；不可用时不显示伪造数字。
 			if msg.Usage != nil && msg.Usage.Available {
 				m.progressStatus = fmt.Sprintf("tokens %d", msg.Usage.TotalTokens)
+				if msg.Usage.CacheAvailable {
+					m.progressStatus = fmt.Sprintf(
+						"tokens %d cache read %d/create %d",
+						msg.Usage.TotalTokens,
+						msg.Usage.CacheReadInputTokens,
+						msg.Usage.CacheCreationInputTokens,
+					)
+				}
 			}
 			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
 

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"onecode/internal/config"
-	"onecode/internal/prompt"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -53,7 +52,7 @@ func (p *openaiProvider) Model() string {
 }
 
 // Stream 发起流式对话
-func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition) (<-chan StreamEvent, <-chan error) {
+func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition, opts StreamOptions) (<-chan StreamEvent, <-chan error) {
 	events := make(chan StreamEvent, 1)
 	errs := make(chan error, 1)
 
@@ -61,9 +60,16 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 		defer close(events)
 		defer close(errs)
 
-		// 转换消息格式，首条插入 system message
-		messages := []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(prompt.SystemPrompt),
+		// 转换消息格式，先插入稳定 system prompt，再插入运行时 reminders。
+		messages := make([]openai.ChatCompletionMessageParamUnion, 0, len(msgs)+len(opts.Prompt.Reminders)+1)
+		if opts.Prompt.StableSystem != "" {
+			messages = append(messages, openai.SystemMessage(opts.Prompt.StableSystem))
+		}
+		for _, reminder := range opts.Prompt.Reminders {
+			if reminder.Content == "" {
+				continue
+			}
+			messages = append(messages, openai.SystemMessage(reminder.Content))
 		}
 
 		for _, msg := range msgs {
@@ -244,6 +250,7 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 					OutputTokens: int(event.Usage.CompletionTokens),
 					TotalTokens:  int(event.Usage.TotalTokens),
 					Available:    true,
+					Cache:        CacheUsage{Available: false},
 				}}:
 				case <-ctx.Done():
 					return

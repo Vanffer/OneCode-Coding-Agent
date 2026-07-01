@@ -2,9 +2,6 @@ package agent
 
 import (
 	"context"
-	"os"
-	"runtime"
-	"time"
 
 	"onecode/internal/conversation"
 	"onecode/internal/llm"
@@ -31,7 +28,7 @@ func (a *Agent) runLoop(ctx context.Context, conv *conversation.Conversation, op
 		})
 
 		stream, errs := a.provider.Stream(ctx, conv.Messages(), a.toolDefinitionsForMode(opts.Mode), llm.StreamOptions{
-			Prompt: a.promptPayload(opts, iteration),
+			Prompt: a.promptPayload(ctx, opts, iteration),
 		})
 		response, err := a.collectModelResponse(ctx, stream, errs, events, iteration)
 		if err != nil {
@@ -108,19 +105,8 @@ func (a *Agent) runLoop(ctx context.Context, conv *conversation.Conversation, op
 	}
 }
 
-func (a *Agent) promptPayload(opts RunOptions, iteration int) prompt.Payload {
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
-	}
-	return a.promptRuntime.BuildPayload(prompt.RequestContext{
-		Mode:             opts.Mode.String(),
-		Iteration:        iteration,
-		CWD:              cwd,
-		OS:               runtime.GOOS,
-		Now:              time.Now(),
-		ReminderInterval: opts.ReminderInterval,
-	})
+func (a *Agent) promptPayload(ctx context.Context, opts RunOptions, iteration int) prompt.Payload {
+	return a.promptRuntime.BuildPayload(buildRequestContext(ctx, opts, iteration))
 }
 
 func (a *Agent) toolDefinitionsForMode(mode Mode) []llm.ToolDefinition {

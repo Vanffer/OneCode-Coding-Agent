@@ -20,6 +20,9 @@ type RequestContext struct {
 	Iteration        int
 	CWD              string
 	OS               string
+	Arch             string
+	Shell            string
+	GitStatus        string
 	Now              time.Time
 	ReminderInterval int
 }

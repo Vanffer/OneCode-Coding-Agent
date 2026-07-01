@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"onecode/internal/llm"
+	"onecode/internal/permission"
 	"onecode/internal/tools"
 )
 
@@ -166,5 +168,34 @@ func TestSchedulerUnknownTool(t *testing.T) {
 	}
 	if len(results) != 1 || !results[0].IsError {
 		t.Fatalf("expected unknown tool error, got %+v", results)
+	}
+}
+
+func TestSchedulerPermissionDenialReturnsToolError(t *testing.T) {
+	recorder := newToolRecorder()
+	registry := tools.NewRegistry()
+	registry.RegisterWithSafety(&fakeTool{name: "bash", recorder: recorder}, tools.SafetySideEffect)
+	manager, err := permission.NewManager(permission.ManagerOptions{
+		Mode:        permission.ModeDefault,
+		ProjectRoot: ".",
+		Confirmer:   &permission.StaticConfirmer{Choice: permission.ChoiceDeny},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := New(nil, registry, WithPermissionManager(manager))
+
+	results, bad := agent.executeToolCalls(context.Background(), []llm.ToolCall{
+		{ID: "bash", Name: "bash", Input: map[string]interface{}{"command": "git status"}},
+	}, ModeExecute, make(chan Event, 20))
+
+	if bad != 0 {
+		t.Fatalf("permission denial should not count as bad tool, got %d", bad)
+	}
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "权限拒绝") {
+		t.Fatalf("expected permission tool error, got %+v", results)
+	}
+	if got := recorder.snapshot(); len(got) != 0 {
+		t.Fatalf("denied tool should not execute, got events %v", got)
 	}
 }

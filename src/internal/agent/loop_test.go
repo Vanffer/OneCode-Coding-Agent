@@ -7,6 +7,7 @@ import (
 
 	"onecode/internal/conversation"
 	"onecode/internal/llm"
+	"onecode/internal/permission"
 	"onecode/internal/prompt"
 	"onecode/internal/tools"
 )
@@ -188,6 +189,60 @@ func TestLoopCancelStopsNextProviderCall(t *testing.T) {
 	}
 	if provider.callCount() != 1 {
 		t.Fatalf("expected 1 provider call, got %d", provider.callCount())
+	}
+}
+
+func TestLoopEmitsPermissionRequestAndContinuesAfterAllow(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{
+			{ToolCall: &llm.ToolCall{ID: "bash", Name: "bash", Input: map[string]interface{}{"command": "git status"}}},
+			{Done: true, FinishReason: llm.FinishToolCalls},
+		}},
+		{events: []llm.StreamEvent{
+			{Text: "done"},
+			{Done: true, FinishReason: llm.FinishStop},
+		}},
+	}}
+	registry := tools.NewRegistry()
+	registry.RegisterWithSafety(&fakeTool{name: "bash", result: "ok"}, tools.SafetySideEffect)
+	manager, err := permission.NewManager(permission.ManagerOptions{
+		Mode:        permission.ModeDefault,
+		ProjectRoot: ".",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := New(provider, registry, WithPermissionManager(manager))
+
+	var sawPermission bool
+	var sawToolResult bool
+	events := agent.Run(context.Background(), conversation.New(), RunOptions{Mode: ModeExecute})
+	for event := range events {
+		switch event.Type {
+		case EventPermissionRequest:
+			sawPermission = true
+			if event.Permission == nil || event.Permission.Request.Tool != "bash" {
+				t.Fatalf("expected bash permission request, got %+v", event.Permission)
+			}
+			agent.RespondPermission(permission.ConfirmationResponse{
+				RequestID: event.Permission.Request.ID,
+				Choice:    permission.ChoiceAllowOnce,
+			})
+		case EventToolResult:
+			if event.Tool != nil && event.Tool.Name == "bash" && !event.Tool.IsError {
+				sawToolResult = true
+			}
+		}
+	}
+
+	if !sawPermission {
+		t.Fatal("expected permission request event")
+	}
+	if !sawToolResult {
+		t.Fatal("expected allowed tool result event")
+	}
+	if provider.callCount() != 2 {
+		t.Fatalf("expected loop to continue after permission, got %d provider calls", provider.callCount())
 	}
 }
 

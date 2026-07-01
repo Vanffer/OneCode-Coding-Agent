@@ -26,6 +26,13 @@ type bashArgs struct {
 	Command string `json:"command"`
 }
 
+func CommandShellName() string {
+	if runtime.GOOS == "windows" {
+		return "cmd"
+	}
+	return "sh"
+}
+
 func (t *BashTool) Name() string { return "bash" }
 
 func (t *BashTool) Description() string {
@@ -69,7 +76,7 @@ func (t *BashTool) Execute(ctx context.Context, args map[string]interface{}) Res
 
 	// 根据平台选择 shell
 	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
+	if CommandShellName() == "cmd" {
 		cmd = exec.CommandContext(ctx, "cmd", "/C", a.Command)
 	} else {
 		cmd = exec.CommandContext(ctx, "sh", "-c", a.Command)

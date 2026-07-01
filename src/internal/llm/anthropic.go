@@ -16,6 +16,11 @@ import (
 // anthropicStreamIdleTimeout 流式空闲超时
 const anthropicStreamIdleTimeout = 5 * time.Minute
 
+// defaultAnthropicMaxOutputTokens is an internal output budget. It is higher
+// than the old 4096 cap so coding tasks can return plans, diffs, and
+// verification details without hitting max_tokens too early.
+const defaultAnthropicMaxOutputTokens int64 = 8192
+
 // anthropicProvider 实现 Anthropic Claude 的 Provider 接口
 type anthropicProvider struct {
 	client *anthropic.Client
@@ -57,50 +62,18 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 		defer close(events)
 		defer close(errs)
 
-		// 转换消息格式
-		messages := make([]anthropic.MessageParam, 0, len(msgs))
-		hasToolUse := false
-		for _, msg := range msgs {
-			if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-				// assistant 消息带工具调用
-				hasToolUse = true
-				blocks := make([]anthropic.ContentBlockParamUnion, 0, len(msg.ToolCalls)+1)
-				if msg.Content != "" {
-					blocks = append(blocks, anthropic.NewTextBlock(msg.Content))
-				}
-				for _, tc := range msg.ToolCalls {
-					blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, tc.Input, tc.Name))
-				}
-				messages = append(messages, anthropic.NewAssistantMessage(blocks...))
-			} else if msg.Role == "tool" && msg.ToolResult != nil {
-				// 工具结果：作为 user 消息的 tool_result 块
-				resultBlock := anthropic.NewToolResultBlock(msg.ToolResult.ToolUseID, msg.ToolResult.Content, msg.ToolResult.IsError)
-				messages = append(messages, anthropic.NewUserMessage(resultBlock))
-			} else if msg.Role == "user" {
-				messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content)))
-			} else if msg.Role == "assistant" {
-				messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content)))
-			}
-		}
+		// 转换消息格式。运行时 system-reminder 走消息通道，不进入顶层 System，
+		// 这样稳定 system prompt 可以保持缓存友好。
+		runtimeMsgs := messagesWithReminders(msgs, opts.Prompt.Reminders)
+		messages, hasToolUse := buildAnthropicMessages(runtimeMsgs)
 
 		// 构建请求参数
-		systemBlocks := make([]anthropic.TextBlockParam, 0, len(opts.Prompt.Reminders)+1)
-		if opts.Prompt.StableSystem != "" {
-			systemBlocks = append(systemBlocks, anthropic.TextBlockParam{
-				Text:         opts.Prompt.StableSystem,
-				CacheControl: anthropic.NewCacheControlEphemeralParam(),
-			})
-		}
-		for _, reminder := range opts.Prompt.Reminders {
-			if reminder.Content == "" {
-				continue
-			}
-			systemBlocks = append(systemBlocks, anthropic.TextBlockParam{Text: reminder.Content})
-		}
+		systemBlocks := buildAnthropicSystemBlocks(opts.Prompt.StableSystem)
+		maxTokens := defaultAnthropicMaxOutputTokens
 
 		params := anthropic.MessageNewParams{
 			Model:     p.cfg.Model,
-			MaxTokens: 4096,
+			MaxTokens: maxTokens,
 			System:    systemBlocks,
 			Messages:  messages,
 		}
@@ -142,7 +115,9 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 		// 如果启用 thinking（无工具时）
 		if p.cfg.Thinking && len(tools) == 0 {
 			params.Thinking = anthropic.ThinkingConfigParamUnion{
-				OfEnabled: &anthropic.ThinkingConfigEnabledParam{},
+				OfEnabled: &anthropic.ThinkingConfigEnabledParam{
+					BudgetTokens: anthropicThinkingBudgetTokens(maxTokens),
+				},
 			}
 		}
 
@@ -311,6 +286,62 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 	}()
 
 	return events, errs
+}
+
+func buildAnthropicSystemBlocks(stableSystem string) []anthropic.TextBlockParam {
+	if stableSystem == "" {
+		return nil
+	}
+	return []anthropic.TextBlockParam{{
+		Text:         stableSystem,
+		CacheControl: anthropic.NewCacheControlEphemeralParam(),
+	}}
+}
+
+func buildAnthropicMessages(msgs []Message) ([]anthropic.MessageParam, bool) {
+	messages := make([]anthropic.MessageParam, 0, len(msgs))
+	hasToolUse := false
+	for _, msg := range msgs {
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			// assistant 消息带工具调用
+			hasToolUse = true
+			blocks := make([]anthropic.ContentBlockParamUnion, 0, len(msg.ToolCalls)+1)
+			if msg.Content != "" {
+				blocks = append(blocks, anthropic.NewTextBlock(msg.Content))
+			}
+			for _, tc := range msg.ToolCalls {
+				blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, tc.Input, tc.Name))
+			}
+			messages = append(messages, anthropic.NewAssistantMessage(blocks...))
+		} else if msg.Role == "tool" && msg.ToolResult != nil {
+			// 工具结果：作为 user 消息的 tool_result 块
+			resultBlock := anthropic.NewToolResultBlock(msg.ToolResult.ToolUseID, msg.ToolResult.Content, msg.ToolResult.IsError)
+			messages = appendAnthropicUserBlocks(messages, resultBlock)
+		} else if msg.Role == "user" {
+			messages = appendAnthropicUserBlocks(messages, anthropic.NewTextBlock(msg.Content))
+		} else if msg.Role == "assistant" {
+			messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content)))
+		}
+	}
+	return messages, hasToolUse
+}
+
+func appendAnthropicUserBlocks(messages []anthropic.MessageParam, blocks ...anthropic.ContentBlockParamUnion) []anthropic.MessageParam {
+	if len(messages) > 0 && messages[len(messages)-1].Role == anthropic.MessageParamRoleUser {
+		messages[len(messages)-1].Content = append(messages[len(messages)-1].Content, blocks...)
+		return messages
+	}
+	return append(messages, anthropic.NewUserMessage(blocks...))
+}
+
+func anthropicThinkingBudgetTokens(maxTokens int64) int64 {
+	if maxTokens <= 1 {
+		return 1
+	}
+	if maxTokens <= 2048 {
+		return maxTokens - 1
+	}
+	return maxTokens / 2
 }
 
 func mapAnthropicFinishReason(reason anthropic.StopReason) FinishReason {

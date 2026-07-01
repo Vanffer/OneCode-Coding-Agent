@@ -35,20 +35,26 @@ func buildEnvironmentReminder(ctx RequestContext) Reminder {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	content := fmt.Sprintf(`<system-reminder>
-Environment:
-- Working directory: %s
-- OS: %s
-- Date: %s
-- Mode: %s
-- Iteration: %d
-</system-reminder>`,
-		emptyDefault(ctx.CWD, "unknown"),
-		emptyDefault(ctx.OS, "unknown"),
-		now.Format("2006-01-02"),
-		emptyDefault(ctx.Mode, "execute"),
-		ctx.Iteration,
-	)
+	var builder strings.Builder
+	builder.WriteString("<system-reminder>\n")
+	builder.WriteString("Environment:\n")
+	builder.WriteString(fmt.Sprintf("- Working directory: %s\n", emptyDefault(ctx.CWD, "unknown")))
+	builder.WriteString(fmt.Sprintf("- OS: %s\n", emptyDefault(ctx.OS, "unknown")))
+	builder.WriteString(fmt.Sprintf("- Arch: %s\n", emptyDefault(ctx.Arch, "unknown")))
+	builder.WriteString(fmt.Sprintf("- Shell: %s\n", emptyDefault(ctx.Shell, "unknown")))
+	builder.WriteString(fmt.Sprintf("- Date: %s\n", now.Format("2006-01-02")))
+	builder.WriteString(fmt.Sprintf("- Mode: %s\n", emptyDefault(ctx.Mode, "execute")))
+	builder.WriteString(fmt.Sprintf("- Iteration: %d\n", ctx.Iteration))
+	if gitStatus := strings.TrimSpace(ctx.GitStatus); gitStatus != "" {
+		builder.WriteString("- Git status (--porcelain=v1 -b):\n")
+		for _, line := range strings.Split(normalizeNewlines(gitStatus), "\n") {
+			builder.WriteString("  ")
+			builder.WriteString(line)
+			builder.WriteString("\n")
+		}
+	}
+	builder.WriteString("</system-reminder>")
+	content := builder.String()
 	return Reminder{Kind: ReminderEnvironment, Content: content}
 }
 
@@ -77,4 +83,8 @@ func emptyDefault(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func normalizeNewlines(value string) string {
+	return strings.ReplaceAll(value, "\r\n", "\n")
 }

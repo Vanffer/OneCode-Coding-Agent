@@ -85,6 +85,28 @@ type StreamOptions struct {
 	Prompt prompt.Payload
 }
 
+// messagesWithReminders returns the persisted conversation plus request-local
+// system reminders represented as user-role messages. The reminders are not
+// written back into conversation history; they only affect the current API call.
+func messagesWithReminders(msgs []Message, reminders []prompt.Reminder) []Message {
+	if len(reminders) == 0 {
+		return msgs
+	}
+
+	out := make([]Message, 0, len(msgs)+len(reminders))
+	out = append(out, msgs...)
+	for _, reminder := range reminders {
+		if reminder.Content == "" {
+			continue
+		}
+		out = append(out, Message{
+			Role:    "user",
+			Content: reminder.Content,
+		})
+	}
+	return out
+}
+
 // Provider 定义 LLM Provider 的统一接口。
 // Stream 新增 tools 参数：传入工具定义列表，模型据此决定是否调用工具。
 type Provider interface {
@@ -93,7 +115,7 @@ type Provider interface {
 	// Model 返回模型名称，用于状态栏右侧显示
 	Model() string
 	// Stream 发起一轮流式对话
-	// opts.Prompt 提供稳定 system prompt 与运行时系统提醒；思考增量内部丢弃
+	// opts.Prompt 提供稳定 system prompt 与运行时系统提醒；运行时提醒应作为消息通道内容注入，避免污染稳定 system prompt。
 	// tools 为工具定义列表，传 nil 表示不使用工具
 	// events 吐出文本增量、工具调用和结束信号；errs 吐出错误（与 events 互斥）
 	// ctx 取消即终止；两个 channel 都由实现方关闭

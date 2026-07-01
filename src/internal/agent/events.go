@@ -1,5 +1,7 @@
 package agent
 
+import "onecode/internal/permission"
+
 // Mode 表示 Agent 本次运行处于哪种工具开放策略。
 type Mode int
 
@@ -36,17 +38,19 @@ const (
 	EventDone
 	EventError
 	EventCancelled
+	EventPermissionRequest
 )
 
 // Event 是 Agent 和 TUI 之间唯一的异步通信载体。
 type Event struct {
-	Type     EventType
-	Text     string
-	Tool     *ToolEvent
-	Usage    *UsageEvent
-	Progress *ProgressEvent
-	Done     *DoneEvent
-	Err      error
+	Type       EventType
+	Text       string
+	Tool       *ToolEvent
+	Usage      *UsageEvent
+	Progress   *ProgressEvent
+	Done       *DoneEvent
+	Permission *PermissionEvent
+	Err        error
 }
 
 // ToolEvent 描述一次工具调用开始或结束时的 UI 摘要。
@@ -56,6 +60,11 @@ type ToolEvent struct {
 	Args    string
 	Result  string
 	IsError bool
+}
+
+// PermissionEvent asks the UI to resolve one pending tool permission request.
+type PermissionEvent struct {
+	Request permission.ConfirmationRequest
 }
 
 // UsageEvent 表示 token 用量更新。

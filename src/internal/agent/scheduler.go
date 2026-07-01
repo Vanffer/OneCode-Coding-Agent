@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"onecode/internal/llm"
+	"onecode/internal/permission"
 	"onecode/internal/tools"
 )
 
@@ -47,12 +48,12 @@ func (a *Agent) executeToolCalls(
 				}
 				end++
 			}
-			a.executeReadOnlyBatch(ctx, calls[i:end], results[i:end], events)
+			a.executeReadOnlyBatch(ctx, calls[i:end], results[i:end], mode, events)
 			i = end
 			continue
 		}
 
-		results[i] = a.executeOneTool(ctx, call, events)
+		results[i] = a.executeOneTool(ctx, call, safety, mode, events)
 		i++
 	}
 
@@ -73,6 +74,7 @@ func (a *Agent) executeReadOnlyBatch(
 	ctx context.Context,
 	calls []llm.ToolCall,
 	results []llm.ToolResult,
+	mode Mode,
 	events chan<- Event,
 ) {
 	var wg sync.WaitGroup
@@ -80,13 +82,13 @@ func (a *Agent) executeReadOnlyBatch(
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i] = a.executeOneTool(ctx, calls[i], events)
+			results[i] = a.executeOneTool(ctx, calls[i], tools.SafetyReadOnly, mode, events)
 		}(i)
 	}
 	wg.Wait()
 }
 
-func (a *Agent) executeOneTool(ctx context.Context, call llm.ToolCall, events chan<- Event) llm.ToolResult {
+func (a *Agent) executeOneTool(ctx context.Context, call llm.ToolCall, safety tools.Safety, mode Mode, events chan<- Event) llm.ToolResult {
 	argsPreview := formatArgsPreview(call.Input)
 	sendEvent(ctx, events, Event{
 		Type: EventToolStart,
@@ -96,6 +98,34 @@ func (a *Agent) executeOneTool(ctx context.Context, call llm.ToolCall, events ch
 			Args: argsPreview,
 		},
 	})
+
+	if a.permissionManager != nil {
+		decision := a.permissionManager.Resolve(ctx, permission.Request{
+			ID:        call.ID,
+			Tool:      call.Name,
+			Args:      call.Input,
+			Safety:    safety,
+			AgentMode: mode.String(),
+		})
+		if decision.Action != permission.ActionAllow {
+			message := fmt.Sprintf("权限拒绝: %s", decision.Reason)
+			sendEvent(ctx, events, Event{
+				Type: EventToolResult,
+				Tool: &ToolEvent{
+					ID:      call.ID,
+					Name:    call.Name,
+					Args:    argsPreview,
+					Result:  truncateResult(message, 200),
+					IsError: true,
+				},
+			})
+			return llm.ToolResult{
+				ToolUseID: call.ID,
+				Content:   message,
+				IsError:   true,
+			}
+		}
+	}
 
 	result := a.registry.Execute(ctx, call.Name, call.Input)
 	toolResult := llm.ToolResult{
@@ -116,6 +146,38 @@ func (a *Agent) executeOneTool(ctx context.Context, call llm.ToolCall, events ch
 	})
 
 	return toolResult
+}
+
+type eventConfirmer struct {
+	mu        sync.Mutex
+	events    chan<- Event
+	responses <-chan permission.ConfirmationResponse
+}
+
+func (c *eventConfirmer) Confirm(ctx context.Context, req permission.ConfirmationRequest) (permission.ConfirmationResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !sendEvent(ctx, c.events, Event{
+		Type:       EventPermissionRequest,
+		Permission: &PermissionEvent{Request: req},
+	}) {
+		return permission.ConfirmationResponse{}, ctx.Err()
+	}
+
+	for {
+		select {
+		case response := <-c.responses:
+			if response.RequestID == "" || response.RequestID == req.ID {
+				if response.RequestID == "" {
+					response.RequestID = req.ID
+				}
+				return response, nil
+			}
+		case <-ctx.Done():
+			return permission.ConfirmationResponse{}, ctx.Err()
+		}
+	}
 }
 
 func (a *Agent) badToolResult(ctx context.Context, call llm.ToolCall, message string, events chan<- Event) llm.ToolResult {

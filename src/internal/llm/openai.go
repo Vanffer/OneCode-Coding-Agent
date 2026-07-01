@@ -60,62 +60,7 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 		defer close(events)
 		defer close(errs)
 
-		// 转换消息格式，先插入稳定 system prompt，再插入运行时 reminders。
-		messages := make([]openai.ChatCompletionMessageParamUnion, 0, len(msgs)+len(opts.Prompt.Reminders)+1)
-		if opts.Prompt.StableSystem != "" {
-			messages = append(messages, openai.SystemMessage(opts.Prompt.StableSystem))
-		}
-		for _, reminder := range opts.Prompt.Reminders {
-			if reminder.Content == "" {
-				continue
-			}
-			messages = append(messages, openai.SystemMessage(reminder.Content))
-		}
-
-		for _, msg := range msgs {
-			if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-				// assistant 消息带工具调用
-				assistantMsg := openai.ChatCompletionAssistantMessageParam{
-					Content: openai.ChatCompletionAssistantMessageParamContentUnion{
-						OfString: param.Opt[string]{
-							Value: msg.Content,
-						},
-					},
-				}
-				for _, tc := range msg.ToolCalls {
-					inputJSON, _ := json.Marshal(tc.Input)
-					assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, openai.ChatCompletionMessageToolCallUnionParam{
-						OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
-							ID: tc.ID,
-							Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
-								Name:      tc.Name,
-								Arguments: string(inputJSON),
-							},
-						},
-					})
-				}
-				messages = append(messages, openai.ChatCompletionMessageParamUnion{
-					OfAssistant: &assistantMsg,
-				})
-			} else if msg.Role == "tool" && msg.ToolResult != nil {
-				// 工具结果
-				toolMsg := openai.ChatCompletionToolMessageParam{
-					ToolCallID: msg.ToolResult.ToolUseID,
-					Content: openai.ChatCompletionToolMessageParamContentUnion{
-						OfString: param.Opt[string]{
-							Value: msg.ToolResult.Content,
-						},
-					},
-				}
-				messages = append(messages, openai.ChatCompletionMessageParamUnion{
-					OfTool: &toolMsg,
-				})
-			} else if msg.Role == "user" {
-				messages = append(messages, openai.UserMessage(msg.Content))
-			} else if msg.Role == "assistant" {
-				messages = append(messages, openai.AssistantMessage(msg.Content))
-			}
-		}
+		messages := buildOpenAIChatMessages(msgs, opts)
 
 		// 构建请求参数
 		params := openai.ChatCompletionNewParams{
@@ -244,13 +189,17 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 
 			event := stream.Current()
 			if event.Usage.TotalTokens > 0 || event.Usage.PromptTokens > 0 || event.Usage.CompletionTokens > 0 {
+				cacheReadTokens := int(event.Usage.PromptTokensDetails.CachedTokens)
 				select {
 				case events <- StreamEvent{Usage: &Usage{
 					InputTokens:  int(event.Usage.PromptTokens),
 					OutputTokens: int(event.Usage.CompletionTokens),
 					TotalTokens:  int(event.Usage.TotalTokens),
 					Available:    true,
-					Cache:        CacheUsage{Available: false},
+					Cache: CacheUsage{
+						Available:       true,
+						ReadInputTokens: cacheReadTokens,
+					},
 				}}:
 				case <-ctx.Done():
 					return
@@ -339,6 +288,61 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 	}()
 
 	return events, errs
+}
+
+func buildOpenAIChatMessages(msgs []Message, opts StreamOptions) []openai.ChatCompletionMessageParamUnion {
+	runtimeMsgs := messagesWithReminders(msgs, opts.Prompt.Reminders)
+	messages := make([]openai.ChatCompletionMessageParamUnion, 0, len(runtimeMsgs)+1)
+	if opts.Prompt.StableSystem != "" {
+		messages = append(messages, openai.SystemMessage(opts.Prompt.StableSystem))
+	}
+
+	for _, msg := range runtimeMsgs {
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			// assistant 消息带工具调用
+			assistantMsg := openai.ChatCompletionAssistantMessageParam{
+				Content: openai.ChatCompletionAssistantMessageParamContentUnion{
+					OfString: param.Opt[string]{
+						Value: msg.Content,
+					},
+				},
+			}
+			for _, tc := range msg.ToolCalls {
+				inputJSON, _ := json.Marshal(tc.Input)
+				assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, openai.ChatCompletionMessageToolCallUnionParam{
+					OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
+						ID: tc.ID,
+						Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
+							Name:      tc.Name,
+							Arguments: string(inputJSON),
+						},
+					},
+				})
+			}
+			messages = append(messages, openai.ChatCompletionMessageParamUnion{
+				OfAssistant: &assistantMsg,
+			})
+		} else if msg.Role == "tool" && msg.ToolResult != nil {
+			// 工具结果
+			toolMsg := openai.ChatCompletionToolMessageParam{
+				ToolCallID: msg.ToolResult.ToolUseID,
+				Content: openai.ChatCompletionToolMessageParamContentUnion{
+					OfString: param.Opt[string]{
+						Value: msg.ToolResult.Content,
+					},
+				},
+			}
+			messages = append(messages, openai.ChatCompletionMessageParamUnion{
+				OfTool: &toolMsg,
+			})
+		} else if msg.Role == "user" {
+			messages = append(messages, openai.UserMessage(msg.Content))
+		} else if msg.Role == "assistant" {
+			messages = append(messages, openai.AssistantMessage(msg.Content))
+		}
+	}
+
+	return messages
 }
 
 func mapOpenAIFinishReason(reason string) FinishReason {

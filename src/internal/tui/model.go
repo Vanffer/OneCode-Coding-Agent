@@ -10,6 +10,7 @@ import (
 	"onecode/internal/config"
 	"onecode/internal/conversation"
 	"onecode/internal/llm"
+	"onecode/internal/permission"
 	"onecode/internal/tools"
 
 	"charm.land/bubbles/v2/spinner"
@@ -22,9 +23,10 @@ import (
 type sessionState int
 
 const (
-	stateSelecting sessionState = iota // 多 provider 时的选择界面
-	stateIdle                          // 等待用户输入
-	stateStreaming                     // 等待/接收模型流（spinner+计时）
+	stateSelecting         sessionState = iota // 多 provider 时的选择界面
+	stateIdle                                  // 等待用户输入
+	stateStreaming                             // 等待/接收模型流（spinner+计时）
+	statePermissionConfirm                     // 等待用户确认工具权限
 )
 
 // Model 是 TUI 的主模型
@@ -38,16 +40,18 @@ type Model struct {
 	provider        llm.Provider
 	agent           *agent.Agent
 	registry        *tools.Registry
+	projectRoot     string
 	conv            *conversation.Conversation
 	agentEvents     <-chan agent.Event // 当前 agent 事件
 	cancelCurrent   context.CancelFunc // 当前 agent run 的取消函数
-	pendingPlan     *PendingPlan       // /plan 生成、/do 消费的待执行计划
-	currentMode     agent.Mode         // 当前运行模式
-	progressStatus  string             // Agent 进度状态栏文案
-	curReply        *strings.Builder   // 本轮 assistant 增量缓冲
-	pendingChars    int                // 待渲染字符数（用于批量更新）
-	pendingMarkdown string             // 待打印的 markdown
-	turnStart       time.Time          // 计时起点
+	pendingPerm     *agent.PermissionEvent
+	pendingPlan     *PendingPlan     // /plan 生成、/do 消费的待执行计划
+	currentMode     agent.Mode       // 当前运行模式
+	progressStatus  string           // Agent 进度状态栏文案
+	curReply        *strings.Builder // 本轮 assistant 增量缓冲
+	pendingChars    int              // 待渲染字符数（用于批量更新）
+	pendingMarkdown string           // 待打印的 markdown
+	turnStart       time.Time        // 计时起点
 	width, height   int
 	ready           bool  // 界面是否已初始化
 	err             error // 错误信息
@@ -70,7 +74,7 @@ type tickMsg time.Time
 type doneMsg struct{}
 
 // New 创建新的 TUI 模型
-func New(providers []config.ProviderConfig, registry *tools.Registry) Model {
+func New(providers []config.ProviderConfig, registry *tools.Registry, projectRoot string) Model {
 	// 创建 textarea
 	ta := textarea.New()
 	ta.Placeholder = "Send a message..."
@@ -93,30 +97,51 @@ func New(providers []config.ProviderConfig, registry *tools.Registry) Model {
 	// 如果只有一个 provider，直接使用它；否则进入选择状态
 	var provider llm.Provider
 	var ag *agent.Agent
+	var initErr error
 	state := stateSelecting
 	if len(providers) == 1 {
 		p, err := llm.New(providers[0])
 		if err == nil {
 			provider = p
-			ag = agent.New(provider, registry)
-			state = stateIdle
+			ag, initErr = newAgent(provider, registry, projectRoot)
+			if initErr == nil {
+				state = stateIdle
+			}
+		} else {
+			initErr = err
 		}
 	}
 
 	return Model{
-		state:     state,
-		textarea:  ta,
-		spinner:   s,
-		renderer:  renderer,
-		providers: providers,
-		provider:  provider,
-		agent:     ag,
-		registry:  registry,
-		conv:      conversation.New(),
-		curReply:  &strings.Builder{},
-		width:     80,
-		height:    24,
+		state:       state,
+		textarea:    ta,
+		spinner:     s,
+		renderer:    renderer,
+		providers:   providers,
+		provider:    provider,
+		agent:       ag,
+		registry:    registry,
+		projectRoot: projectRoot,
+		conv:        conversation.New(),
+		curReply:    &strings.Builder{},
+		width:       80,
+		height:      24,
+		err:         initErr,
 	}
+}
+
+func newAgent(provider llm.Provider, registry *tools.Registry, projectRoot string) (*agent.Agent, error) {
+	if projectRoot == "" {
+		projectRoot = "."
+	}
+	manager, err := permission.NewManager(permission.ManagerOptions{
+		ProjectRoot: projectRoot,
+		Store:       permission.DefaultFileStore(projectRoot),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return agent.New(provider, registry, agent.WithPermissionManager(manager)), nil
 }
 
 // Init 初始化模型
@@ -192,9 +217,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 				m.provider = provider
-				m.agent = agent.New(provider, m.registry)
+				ag, err := newAgent(provider, m.registry, m.projectRoot)
+				if err != nil {
+					m.err = err
+					return m, tea.Quit
+				}
+				m.agent = ag
 				m.state = stateIdle
 				return m, nil
+			}
+			return m, nil
+		}
+
+		if m.state == statePermissionConfirm {
+			switch msg.String() {
+			case "d":
+				next, cmd := m.answerPermission(permission.ChoiceDeny)
+				return next, cmd
+			case "o":
+				next, cmd := m.answerPermission(permission.ChoiceAllowOnce)
+				return next, cmd
+			case "s":
+				next, cmd := m.answerPermission(permission.ChoiceAllowSession)
+				return next, cmd
+			case "f":
+				next, cmd := m.answerPermission(permission.ChoiceAllowForever)
+				return next, cmd
+			case "esc":
+				next, cmd := m.cancelPermissionRun()
+				return next, cmd
 			}
 			return m, nil
 		}
@@ -279,6 +330,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentEventMsg:
 		// 处理 agent 事件
 		switch msg.Type {
+		case agent.EventPermissionRequest:
+			if msg.Permission != nil {
+				m.pendingPerm = msg.Permission
+				m.progressStatus = "Waiting for permission"
+				m.state = statePermissionConfirm
+				cmds = append(cmds, tea.Println(formatPermissionPrompt(msg.Permission.Request)))
+			}
+			return m, tea.Batch(cmds...)
+
 		case agent.EventError:
 			// 错误处理
 			if msg.Err != nil {
@@ -437,6 +497,54 @@ func (m Model) cancelAgentRun() (Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) answerPermission(choice permission.ConfirmationChoice) (Model, tea.Cmd) {
+	if m.agent != nil && m.pendingPerm != nil {
+		m.agent.RespondPermission(permission.ConfirmationResponse{
+			RequestID: m.pendingPerm.Request.ID,
+			Choice:    choice,
+		})
+	}
+	m.pendingPerm = nil
+	m.state = stateStreaming
+	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+}
+
+func (m Model) cancelPermissionRun() (Model, tea.Cmd) {
+	if m.agent != nil && m.pendingPerm != nil {
+		m.agent.RespondPermission(permission.ConfirmationResponse{
+			RequestID: m.pendingPerm.Request.ID,
+			Choice:    permission.ChoiceDeny,
+		})
+	}
+	m.pendingPerm = nil
+	if m.cancelCurrent != nil {
+		m.cancelCurrent()
+		m.progressStatus = "Cancelling"
+	}
+	m.state = stateStreaming
+	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+}
+
+func formatPermissionPrompt(req permission.ConfirmationRequest) string {
+	var s strings.Builder
+	s.WriteString("\n? Permission required\n")
+	s.WriteString(fmt.Sprintf("  tool: %s\n", req.Tool))
+	if req.Target != "" {
+		s.WriteString(fmt.Sprintf("  target: %s\n", req.Target))
+	}
+	if req.Risk != "" {
+		s.WriteString(fmt.Sprintf("  risk: %s\n", req.Risk))
+	}
+	if req.Reason != "" {
+		s.WriteString(fmt.Sprintf("  reason: %s\n", req.Reason))
+	}
+	if req.ArgsPreview != "" {
+		s.WriteString(fmt.Sprintf("  args: %s\n", req.ArgsPreview))
+	}
+	s.WriteString("  [d] deny  [o] once  [s] session  [f] forever  [esc] cancel\n")
+	return s.String()
+}
+
 // View 渲染视图
 func (m Model) View() tea.View {
 	if m.err != nil {
@@ -450,6 +558,8 @@ func (m Model) View() tea.View {
 		return tea.NewView(m.viewIdle())
 	case stateStreaming:
 		return tea.NewView(m.viewStreaming())
+	case statePermissionConfirm:
+		return tea.NewView(m.viewPermissionConfirm())
 	default:
 		return tea.NewView("")
 	}
@@ -508,6 +618,39 @@ func (m Model) viewStreaming() string {
 
 	// 输入框（禁用状态）
 	s.WriteString("❯ ...\n")
+
+	return s.String()
+}
+
+func (m Model) viewPermissionConfirm() string {
+	var s strings.Builder
+
+	elapsed := time.Since(m.turnStart).Seconds()
+	status := fmt.Sprintf("Permission %.1fs", elapsed)
+	s.WriteString(statusBar(m.provider, status, m.width))
+	s.WriteString("\n")
+
+	if m.curReply.Len() > 0 {
+		s.WriteString("\n")
+		s.WriteString(m.curReply.String())
+		s.WriteString("\n")
+	}
+
+	if m.pendingPerm != nil {
+		req := m.pendingPerm.Request
+		s.WriteString("\nPermission required\n")
+		s.WriteString(fmt.Sprintf("tool: %s\n", req.Tool))
+		if req.Target != "" {
+			s.WriteString(fmt.Sprintf("target: %s\n", req.Target))
+		}
+		if req.Risk != "" {
+			s.WriteString(fmt.Sprintf("risk: %s\n", req.Risk))
+		}
+		if req.Reason != "" {
+			s.WriteString(fmt.Sprintf("reason: %s\n", req.Reason))
+		}
+		s.WriteString("\n[d] deny  [o] once  [s] session  [f] forever  [esc] cancel\n")
+	}
 
 	return s.String()
 }

@@ -10,6 +10,7 @@
 
 # Go 测试覆盖率
 *.out
+.gocache/
 
 # IDE
 .idea/

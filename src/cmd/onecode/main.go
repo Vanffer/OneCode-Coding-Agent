@@ -24,7 +24,7 @@ func main() {
 	// 获取当前工作目录
 	cwd, err := os.Getwd()
 	if err != nil {
-		cwd = "unknown"
+		cwd = "."
 	}
 
 	// 打印启动横幅
@@ -40,7 +40,7 @@ func main() {
 	registry.RegisterWithSafety(&tools.GrepTool{}, tools.SafetyReadOnly)
 
 	// 创建 TUI 模型
-	model := tui.New(cfg.Providers, registry)
+	model := tui.New(cfg.Providers, registry, cwd)
 
 	// 启动 TUI
 	p := tea.NewProgram(model, tea.WithOutput(os.Stderr))

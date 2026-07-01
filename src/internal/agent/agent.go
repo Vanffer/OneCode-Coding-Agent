@@ -5,6 +5,7 @@ import (
 
 	"onecode/internal/conversation"
 	"onecode/internal/llm"
+	"onecode/internal/permission"
 	"onecode/internal/prompt"
 	"onecode/internal/tools"
 )
@@ -17,21 +18,50 @@ const (
 
 // Agent 持有 provider 与工具注册中心，执行 ReAct agent loop。
 type Agent struct {
-	provider      llm.Provider
-	registry      *tools.Registry
-	promptRuntime *prompt.Runtime
+	provider            llm.Provider
+	registry            *tools.Registry
+	promptRuntime       *prompt.Runtime
+	permissionManager   *permission.Manager
+	permissionResponses chan permission.ConfirmationResponse
+}
+
+// Option customizes an Agent.
+type Option func(*Agent)
+
+func WithPromptRuntime(runtime *prompt.Runtime) Option {
+	return func(a *Agent) {
+		if runtime != nil {
+			a.promptRuntime = runtime
+		}
+	}
+}
+
+func WithPermissionManager(manager *permission.Manager) Option {
+	return func(a *Agent) {
+		a.permissionManager = manager
+	}
 }
 
 // New 创建 Agent。
-func New(p llm.Provider, r *tools.Registry, runtimes ...*prompt.Runtime) *Agent {
-	pr := defaultPromptRuntime()
-	if len(runtimes) > 0 && runtimes[0] != nil {
-		pr = runtimes[0]
+func New(p llm.Provider, r *tools.Registry, opts ...Option) *Agent {
+	a := &Agent{
+		provider:            p,
+		registry:            r,
+		promptRuntime:       defaultPromptRuntime(),
+		permissionResponses: make(chan permission.ConfirmationResponse, 16),
 	}
-	return &Agent{
-		provider:      p,
-		registry:      r,
-		promptRuntime: pr,
+	for _, opt := range opts {
+		if opt != nil {
+			opt(a)
+		}
+	}
+	return a
+}
+
+func (a *Agent) RespondPermission(response permission.ConfirmationResponse) {
+	select {
+	case a.permissionResponses <- response:
+	default:
 	}
 }
 
@@ -43,6 +73,12 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, opts R
 
 	go func() {
 		defer close(events)
+		if a.permissionManager != nil {
+			a.permissionManager.SetConfirmer(&eventConfirmer{
+				events:    events,
+				responses: a.permissionResponses,
+			})
+		}
 		a.runLoop(ctx, conv, opts, events)
 	}()
 

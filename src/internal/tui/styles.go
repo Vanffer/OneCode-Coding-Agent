@@ -47,4 +47,19 @@ var (
 	toolErrorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196")). // 红色
 			Bold(true)
+
+	permissionTitleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("141")).
+				Bold(true)
+
+	permissionSelectedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("230")).
+				Background(lipgloss.Color("62")).
+				Bold(true)
+
+	permissionOptionStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252"))
+
+	permissionHintStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("245"))
 )

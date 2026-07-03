@@ -69,9 +69,15 @@ func TestManagerModePolicy(t *testing.T) {
 		{"strict read asks", ModeStrict, Request{Tool: "read_file", Safety: tools.SafetyReadOnly}, ActionAsk},
 		{"default read allows", ModeDefault, Request{Tool: "read_file", Safety: tools.SafetyReadOnly}, ActionAllow},
 		{"default write asks", ModeDefault, Request{Tool: "edit_file", Safety: tools.SafetySideEffect}, ActionAsk},
-		{"permissive edit allows", ModePermissive, Request{Tool: "edit_file", Safety: tools.SafetySideEffect}, ActionAllow},
-		{"permissive bash asks", ModePermissive, Request{Tool: "bash", Safety: tools.SafetySideEffect}, ActionAsk},
-		{"bypass bash allows", ModeBypass, Request{Tool: "bash", Safety: tools.SafetySideEffect}, ActionAllow},
+		{"accept edits allows write", ModeAcceptEdits, Request{Tool: "edit_file", Safety: tools.SafetySideEffect}, ActionAllow},
+		{"accept edits asks command", ModeAcceptEdits, Request{Tool: "bash", Safety: tools.SafetySideEffect}, ActionAsk},
+		{"plan allows read", ModePlan, Request{Tool: "read_file", Safety: tools.SafetyReadOnly}, ActionAllow},
+		{"plan denies write", ModePlan, Request{Tool: "edit_file", Safety: tools.SafetySideEffect}, ActionDeny},
+		{"default asks mcp", ModeDefault, Request{Tool: "mcp__demo__mutate", Safety: tools.SafetySideEffect, Category: tools.CategoryMCP}, ActionAsk},
+		{"accept edits asks mcp", ModeAcceptEdits, Request{Tool: "mcp__demo__mutate", Safety: tools.SafetySideEffect, Category: tools.CategoryMCP}, ActionAsk},
+		{"bypass permissions allows bash", ModeBypass, Request{Tool: "bash", Safety: tools.SafetySideEffect}, ActionAllow},
+		{"bypass permissions allows mcp", ModeBypass, Request{Tool: "mcp__demo__mutate", Safety: tools.SafetySideEffect, Category: tools.CategoryMCP}, ActionAllow},
+		{"bypass permissions asks unknown", ModeBypass, Request{Tool: "custom_tool", Safety: tools.SafetySideEffect, Category: tools.CategoryUnknown}, ActionAsk},
 	}
 
 	for _, tt := range tests {

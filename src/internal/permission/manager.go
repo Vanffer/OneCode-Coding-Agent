@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"onecode/internal/tools"
 )
 
 // ManagerOptions configures a permission manager.
@@ -116,7 +114,10 @@ func (m *Manager) Resolve(ctx context.Context, req Request) Decision {
 	if decision.Action != ActionAsk {
 		return decision
 	}
-	response, err := m.confirmer.Confirm(ctx, decision.Request)
+	if decision.Confirm == nil {
+		return denyDecision("权限确认请求缺失", ScopeMode)
+	}
+	response, err := m.confirmer.Confirm(ctx, *decision.Confirm)
 	if err != nil {
 		return denyDecision("权限确认已取消或失败: "+err.Error(), ScopeMode)
 	}
@@ -177,24 +178,16 @@ func (m *Manager) orderedRuleSets() []RuleSet {
 }
 
 func (m *Manager) defaultByMode(req Request, target Target) Decision {
-	tool := NormalizeToolName(req.Tool)
-	switch m.mode {
-	case ModeStrict:
-		return askDecision(req, target, "Strict 模式需要用户确认")
-	case ModeDefault:
-		if req.Safety == tools.SafetyReadOnly {
-			return Decision{Action: ActionAllow, Reason: "Default 模式允许只读工具", Scope: ScopeMode}
-		}
-		return askDecision(req, target, "Default 模式需要确认有副作用工具")
-	case ModePermissive:
-		if tool == "bash" {
-			return askDecision(req, target, "Permissive 模式仍需确认 Bash")
-		}
-		return Decision{Action: ActionAllow, Reason: "Permissive 模式允许该工具", Scope: ScopeMode}
-	case ModeBypass:
-		return Decision{Action: ActionAllow, Reason: "Bypass 模式允许该工具", Scope: ScopeMode}
+	category := categoryForRequest(req)
+	action := modeDecision(m.mode, category)
+	reason := modeReason(m.mode, category, action)
+	switch action {
+	case ActionAllow:
+		return Decision{Action: ActionAllow, Reason: reason, Scope: ScopeMode}
+	case ActionDeny:
+		return denyDecision(reason, ScopeMode)
 	default:
-		return askDecision(req, target, "未知权限模式需要确认")
+		return askDecision(req, target, reason)
 	}
 }
 
@@ -203,7 +196,7 @@ func askDecision(req Request, target Target, reason string) Decision {
 		Action: ActionAsk,
 		Reason: reason,
 		Scope:  ScopeMode,
-		Request: ConfirmationRequest{
+		Confirm: &ConfirmationRequest{
 			ID:          req.ID,
 			Tool:        NormalizeToolName(req.Tool),
 			ArgsPreview: fmt.Sprintf("%v", req.Args),

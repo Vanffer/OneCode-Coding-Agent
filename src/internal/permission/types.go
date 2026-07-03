@@ -6,10 +6,11 @@ import "onecode/internal/tools"
 type Mode string
 
 const (
-	ModeStrict     Mode = "strict"
-	ModeDefault    Mode = "default"
-	ModePermissive Mode = "permissive"
-	ModeBypass     Mode = "bypass"
+	ModeStrict      Mode = "strict"
+	ModeDefault     Mode = "default"
+	ModeAcceptEdits Mode = "acceptEdits"
+	ModePlan        Mode = "plan"
+	ModeBypass      Mode = "bypassPermissions"
 )
 
 // Action is the result of a permission decision.
@@ -33,13 +34,10 @@ const (
 	ScopeBuiltin Scope = "builtin"
 )
 
-// RawRule is a YAML rule string in the form Tool(pattern): action.
-type RawRule string
-
 // Config is the permissions YAML shape.
 type Config struct {
-	Mode  Mode      `yaml:"mode"`
-	Rules []RawRule `yaml:"rules"`
+	Mode  Mode     `yaml:"mode"`
+	Rules []string `yaml:"rules"`
 }
 
 // Rule is a parsed permission rule.
@@ -58,12 +56,11 @@ type RuleSet struct {
 
 // Request is the authorization input for one tool call.
 type Request struct {
-	ID          string
-	Tool        string
-	Args        map[string]interface{}
-	Safety      tools.Safety
-	AgentMode   string
-	ProjectRoot string
+	ID       string
+	Tool     string
+	Args     map[string]interface{}
+	Safety   tools.Safety
+	Category tools.ToolCategory
 }
 
 // TargetKind describes what kind of subject a tool call targets.
@@ -92,7 +89,7 @@ type Decision struct {
 	Reason  string
 	Scope   Scope
 	Rule    *Rule
-	Request ConfirmationRequest
+	Confirm *ConfirmationRequest
 }
 
 // ConfirmationRequest is shown to a user when a decision needs human input.

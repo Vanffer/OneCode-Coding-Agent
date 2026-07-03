@@ -103,7 +103,7 @@ func (s *FileStore) AppendLocalRule(ctx context.Context, rule Rule) error {
 	}
 
 	rule.Scope = ScopeLocal
-	cfg.Rules = append(cfg.Rules, RawRule(FormatRule(rule)))
+	cfg.Rules = append(cfg.Rules, FormatRule(rule))
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("序列化本地权限配置失败: %w", err)
@@ -152,7 +152,7 @@ func loadRuleFile(path string, scope Scope) (RuleSet, Mode, bool, error) {
 	}
 	set := RuleSet{Scope: scope}
 	for _, raw := range cfg.Rules {
-		rule, err := ParseRule(string(raw), scope)
+		rule, err := ParseRule(raw, scope)
 		if err != nil {
 			return RuleSet{}, "", false, fmt.Errorf("权限规则错误 %s: %w", path, err)
 		}
@@ -163,7 +163,7 @@ func loadRuleFile(path string, scope Scope) (RuleSet, Mode, bool, error) {
 
 func validMode(mode Mode) bool {
 	switch mode {
-	case ModeStrict, ModeDefault, ModePermissive, ModeBypass:
+	case ModeStrict, ModeDefault, ModeAcceptEdits, ModePlan, ModeBypass:
 		return true
 	default:
 		return false

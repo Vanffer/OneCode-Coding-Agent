@@ -126,16 +126,30 @@ func FormatRule(rule Rule) string {
 }
 
 func matchValues(target Target) []string {
-	values := []string{target.Value}
 	switch target.Kind {
 	case TargetCommand:
-		values = append(values, target.Command)
+		return nonEmptyValues(target.Command)
 	case TargetPath:
-		values = append(values, target.Path)
+		return nonEmptyValues(target.Path)
 	case TargetSearch:
-		values = append(values, target.SearchRoot, target.Glob)
+		return nonEmptyValues(target.SearchRoot, target.Glob)
+	default:
+		return nonEmptyValues(target.Value)
 	}
-	return values
+}
+
+func nonEmptyValues(values ...string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		normalized := normalizePattern(value)
+		if normalized == "" || seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		result = append(result, normalized)
+	}
+	return result
 }
 
 func matchPattern(pattern, value string) bool {

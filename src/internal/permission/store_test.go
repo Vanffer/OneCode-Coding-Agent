@@ -34,15 +34,15 @@ func TestFileStoreLoadAndModePrecedence(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustWrite(t, user, "mode: strict\nrules:\n  - \"Bash(git *): allow\"\n")
-	mustWrite(t, project, "mode: bypass\nrules:\n  - \"Bash(git push *): deny\"\n")
-	mustWrite(t, local, "mode: permissive\nrules:\n  - \"Bash(git push origin dev): allow\"\n")
+	mustWrite(t, project, "mode: bypassPermissions\nrules:\n  - \"Bash(git push *): deny\"\n")
+	mustWrite(t, local, "mode: acceptEdits\nrules:\n  - \"Bash(git push origin dev): allow\"\n")
 
 	store := NewFileStore(user, project, local, root)
 	sets, mode, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if mode != ModePermissive {
+	if mode != ModeAcceptEdits {
 		t.Fatalf("expected local mode to win, got %s", mode)
 	}
 	if len(sets) != 3 {

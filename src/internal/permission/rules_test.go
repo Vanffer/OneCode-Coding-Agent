@@ -64,10 +64,24 @@ func TestMatchRule(t *testing.T) {
 			want:   true,
 		},
 		{
+			name:   "command uses command field not generic value",
+			raw:    "Bash(git status): allow",
+			req:    Request{Tool: "bash"},
+			target: Target{Kind: TargetCommand, Value: "git status", Command: "git diff"},
+			want:   false,
+		},
+		{
 			name:   "double star path",
 			raw:    "ReadFile(src/**/*.go): allow",
 			req:    Request{Tool: "read_file"},
 			target: Target{Kind: TargetPath, Value: "src/internal/agent/loop.go", Path: "src/internal/agent/loop.go"},
+			want:   true,
+		},
+		{
+			name:   "search can match glob filter",
+			raw:    "Grep(**/*.go): allow",
+			req:    Request{Tool: "grep"},
+			target: Target{Kind: TargetSearch, Value: "src", SearchRoot: "src", Glob: "**/*.go"},
 			want:   true,
 		},
 		{
@@ -76,6 +90,13 @@ func TestMatchRule(t *testing.T) {
 			req:    Request{Tool: "glob"},
 			target: Target{Kind: TargetSearch, Value: "src", SearchRoot: "src"},
 			want:   false,
+		},
+		{
+			name:   "unknown falls back to generic value",
+			raw:    "Custom(custom target): allow",
+			req:    Request{Tool: "custom"},
+			target: Target{Kind: TargetUnknown, Value: "custom target"},
+			want:   true,
 		},
 	}
 

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"onecode/internal/llm"
@@ -31,14 +32,23 @@ func (r *Registry) Register(t Tool) {
 
 // RegisterWithSafety 注册工具，并显式指定安全分类。
 func (r *Registry) RegisterWithSafety(t Tool, safety Safety) {
+	r.RegisterWithSafetyAndCategory(t, safety, defaultCategory(t.Name(), safety))
+}
+
+// RegisterWithSafetyAndCategory 注册工具，并显式指定调度安全分类和权限风险类别。
+func (r *Registry) RegisterWithSafetyAndCategory(t Tool, safety Safety, category ToolCategory) {
 	name := t.Name()
 	if _, exists := r.tools[name]; exists {
 		return // 已注册，跳过
 	}
+	if category == "" {
+		category = defaultCategory(name, safety)
+	}
 	r.order = append(r.order, name)
 	r.tools[name] = ToolInfo{
-		Tool:   t,
-		Safety: safety,
+		Tool:     t,
+		Safety:   safety,
+		Category: category,
 	}
 }
 
@@ -58,6 +68,18 @@ func (r *Registry) Safety(name string) (Safety, bool) {
 		return SafetySideEffect, false
 	}
 	return info.Safety, true
+}
+
+// Category 返回工具权限风险类别。
+func (r *Registry) Category(name string) (ToolCategory, bool) {
+	info, ok := r.tools[name]
+	if !ok {
+		return CategoryUnknown, false
+	}
+	if info.Category == "" {
+		return defaultCategory(name, info.Safety), true
+	}
+	return info.Category, true
 }
 
 // List 按注册顺序返回所有工具
@@ -157,4 +179,25 @@ func defaultSafety(name string) Safety {
 	default:
 		return SafetySideEffect
 	}
+}
+
+// defaultCategory 为内置工具提供固定权限分类。未知工具保守视为 unknown。
+func defaultCategory(name string, safety Safety) ToolCategory {
+	switch name {
+	case "read_file", "glob", "grep":
+		return CategoryRead
+	case "write_file", "edit_file":
+		return CategoryWrite
+	case "bash":
+		return CategoryCommand
+	case "webfetch", "web_fetch", "websearch", "web_search":
+		return CategoryNetwork
+	}
+	if strings.HasPrefix(name, "mcp__") {
+		return CategoryMCP
+	}
+	if safety == SafetyReadOnly {
+		return CategoryRead
+	}
+	return CategoryUnknown
 }

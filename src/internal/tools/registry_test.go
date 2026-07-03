@@ -62,6 +62,44 @@ func TestRegistryDefaultSafety(t *testing.T) {
 	}
 }
 
+func TestRegistryDefaultCategory(t *testing.T) {
+	registry := NewRegistry()
+	registry.Register(&ReadFileTool{})
+	registry.Register(&GlobTool{})
+	registry.Register(&GrepTool{})
+	registry.Register(&WriteFileTool{})
+	registry.Register(&EditFileTool{})
+	registry.Register(&BashTool{})
+	registry.RegisterWithSafety(registryTestTool{name: "mcp__demo__read"}, SafetySideEffect)
+	registry.RegisterWithSafety(registryTestTool{name: "custom_side_effect"}, SafetySideEffect)
+
+	tests := []struct {
+		name string
+		want ToolCategory
+	}{
+		{"read_file", CategoryRead},
+		{"glob", CategoryRead},
+		{"grep", CategoryRead},
+		{"write_file", CategoryWrite},
+		{"edit_file", CategoryWrite},
+		{"bash", CategoryCommand},
+		{"mcp__demo__read", CategoryMCP},
+		{"custom_side_effect", CategoryUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := registry.Category(tt.name)
+			if !ok {
+				t.Fatalf("expected tool %q to be registered", tt.name)
+			}
+			if got != tt.want {
+				t.Fatalf("expected category %s, got %s", tt.want, got)
+			}
+		})
+	}
+}
+
 func TestRegistryDefinitionsBySafety(t *testing.T) {
 	registry := NewRegistry()
 	registry.Register(&ReadFileTool{})
@@ -102,6 +140,19 @@ func TestRegistryRegisterWithSafety(t *testing.T) {
 	}
 }
 
+func TestRegistryRegisterWithSafetyAndCategory(t *testing.T) {
+	registry := NewRegistry()
+	registry.RegisterWithSafetyAndCategory(registryTestTool{name: "custom_network"}, SafetySideEffect, CategoryNetwork)
+
+	category, ok := registry.Category("custom_network")
+	if !ok {
+		t.Fatal("expected custom tool to be registered")
+	}
+	if category != CategoryNetwork {
+		t.Fatalf("expected network category, got %s", category)
+	}
+}
+
 func TestRegistryUnknownSafety(t *testing.T) {
 	registry := NewRegistry()
 
@@ -111,6 +162,18 @@ func TestRegistryUnknownSafety(t *testing.T) {
 	}
 	if safety != SafetySideEffect {
 		t.Fatalf("expected conservative side-effect safety, got %v", safety)
+	}
+}
+
+func TestRegistryUnknownCategory(t *testing.T) {
+	registry := NewRegistry()
+
+	category, ok := registry.Category("missing")
+	if ok {
+		t.Fatal("expected missing tool lookup to fail")
+	}
+	if category != CategoryUnknown {
+		t.Fatalf("expected unknown category, got %s", category)
 	}
 }
 

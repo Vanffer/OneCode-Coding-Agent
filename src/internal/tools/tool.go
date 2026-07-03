@@ -21,10 +21,23 @@ const (
 	SafetySideEffect
 )
 
-// ToolInfo 保存工具实例及其固定安全分类。
+// ToolCategory 描述工具的权限风险类别，供 permission 包决定默认策略。
+type ToolCategory string
+
+const (
+	CategoryRead    ToolCategory = "read"
+	CategoryWrite   ToolCategory = "write"
+	CategoryCommand ToolCategory = "command"
+	CategoryNetwork ToolCategory = "network"
+	CategoryMCP     ToolCategory = "mcp"
+	CategoryUnknown ToolCategory = "unknown"
+)
+
+// ToolInfo 保存工具实例及其固定调度安全分类和权限风险类别。
 type ToolInfo struct {
-	Tool   Tool
-	Safety Safety
+	Tool     Tool
+	Safety   Safety
+	Category ToolCategory
 }
 
 // Tool 工具接口。每个核心工具实现它。

@@ -41,14 +41,15 @@ Tool(pattern): allow|deny
 mode: strict
 ```
 
-支持四档：
+支持五档：
 
 - `strict`：未命中规则时都询问。
 - `default`：只读工具默认允许，有副作用工具询问。
-- `permissive`：除 Bash 外默认允许，Bash 仍询问。
-- `bypass`：未命中规则时默认允许。
+- `acceptEdits`：只读和文件编辑类工具默认允许，命令、网络、MCP 和未知工具仍询问。
+- `plan`：只读工具默认允许，写入、命令、网络、MCP 和未知工具默认拒绝。
+- `bypassPermissions`：已知类别工具默认允许，未知工具仍询问。
 
-黑名单和路径沙箱不受 `mode` 影响。即使是 `bypass`，危险 Bash 命令和项目根外路径也会被拒绝。
+黑名单和路径沙箱不受 `mode` 影响。即使是 `bypassPermissions`，危险 Bash 命令和项目根外路径也会被拒绝。
 
 ## 常见写法
 

@@ -45,6 +45,7 @@ type Model struct {
 	agentEvents     <-chan agent.Event // 当前 agent 事件
 	cancelCurrent   context.CancelFunc // 当前 agent run 的取消函数
 	pendingPerm     *agent.PermissionEvent
+	permSelectIndex int
 	pendingPlan     *PendingPlan     // /plan 生成、/do 消费的待执行计划
 	currentMode     agent.Mode       // 当前运行模式
 	progressStatus  string           // Agent 进度状态栏文案
@@ -231,6 +232,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.state == statePermissionConfirm {
 			switch msg.String() {
+			case "up", "k", "shift+tab":
+				m.movePermissionSelection(-1)
+				return m, nil
+			case "down", "j", "tab":
+				m.movePermissionSelection(1)
+				return m, nil
+			case "enter", " ":
+				next, cmd := m.confirmSelectedPermission()
+				return next, cmd
+			case "1":
+				next, cmd := m.answerPermission(permission.ChoiceAllowOnce)
+				return next, cmd
+			case "2":
+				next, cmd := m.answerPermission(permission.ChoiceAllowSession)
+				return next, cmd
+			case "3":
+				next, cmd := m.answerPermission(permission.ChoiceAllowForever)
+				return next, cmd
+			case "4":
+				next, cmd := m.answerPermission(permission.ChoiceDeny)
+				return next, cmd
+			case "5":
+				next, cmd := m.cancelPermissionRun()
+				return next, cmd
 			case "d":
 				next, cmd := m.answerPermission(permission.ChoiceDeny)
 				return next, cmd
@@ -312,18 +337,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case spinner.TickMsg:
-		if m.state == stateStreaming {
+		if isActiveRunState(m.state) {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			cmds = append(cmds, cmd)
 		}
 
 	case tickMsg:
-		// 定时渲染：流式状态下每 50ms 强制重绘一次
+		// 定时渲染：运行状态下每 50ms 强制重绘一次
 		if m.state == stateStreaming && m.pendingChars > 0 {
 			m.pendingChars = 0
 		}
-		if m.state == stateStreaming {
+		if isActiveRunState(m.state) {
 			cmds = append(cmds, renderTick())
 		}
 
@@ -333,10 +358,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case agent.EventPermissionRequest:
 			if msg.Permission != nil {
 				m.pendingPerm = msg.Permission
+				m.permSelectIndex = 0
 				m.progressStatus = "Waiting for permission"
 				m.state = statePermissionConfirm
-				cmds = append(cmds, tea.Println(formatPermissionPrompt(msg.Permission.Request)))
 			}
+			cmds = append(cmds, m.spinner.Tick, renderTick())
 			return m, tea.Batch(cmds...)
 
 		case agent.EventError:
@@ -525,24 +551,28 @@ func (m Model) cancelPermissionRun() (Model, tea.Cmd) {
 	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
 }
 
-func formatPermissionPrompt(req permission.ConfirmationRequest) string {
-	var s strings.Builder
-	s.WriteString("\n? Permission required\n")
-	s.WriteString(fmt.Sprintf("  tool: %s\n", req.Tool))
-	if req.Target != "" {
-		s.WriteString(fmt.Sprintf("  target: %s\n", req.Target))
+func (m *Model) movePermissionSelection(delta int) {
+	options := permissionOptions()
+	if len(options) == 0 {
+		m.permSelectIndex = 0
+		return
 	}
-	if req.Risk != "" {
-		s.WriteString(fmt.Sprintf("  risk: %s\n", req.Risk))
+	m.permSelectIndex = (m.permSelectIndex + delta + len(options)) % len(options)
+}
+
+func (m Model) confirmSelectedPermission() (Model, tea.Cmd) {
+	options := permissionOptions()
+	if len(options) == 0 {
+		return m, nil
 	}
-	if req.Reason != "" {
-		s.WriteString(fmt.Sprintf("  reason: %s\n", req.Reason))
+	if m.permSelectIndex < 0 || m.permSelectIndex >= len(options) {
+		m.permSelectIndex = 0
 	}
-	if req.ArgsPreview != "" {
-		s.WriteString(fmt.Sprintf("  args: %s\n", req.ArgsPreview))
+	selected := options[m.permSelectIndex]
+	if selected.cancel {
+		return m.cancelPermissionRun()
 	}
-	s.WriteString("  [d] deny  [o] once  [s] session  [f] forever  [esc] cancel\n")
-	return s.String()
+	return m.answerPermission(selected.choice)
 }
 
 // View 渲染视图
@@ -626,7 +656,7 @@ func (m Model) viewPermissionConfirm() string {
 	var s strings.Builder
 
 	elapsed := time.Since(m.turnStart).Seconds()
-	status := fmt.Sprintf("Permission %.1fs", elapsed)
+	status := fmt.Sprintf("%s Permission %.1fs", m.spinner.View(), elapsed)
 	s.WriteString(statusBar(m.provider, status, m.width))
 	s.WriteString("\n")
 
@@ -638,21 +668,62 @@ func (m Model) viewPermissionConfirm() string {
 
 	if m.pendingPerm != nil {
 		req := m.pendingPerm.Request
-		s.WriteString("\nPermission required\n")
-		s.WriteString(fmt.Sprintf("tool: %s\n", req.Tool))
+		s.WriteString("\n")
+		s.WriteString(permissionTitleStyle.Render("Permission required"))
+		s.WriteString("\n")
+		s.WriteString("-------------------\n")
+		s.WriteString(fmt.Sprintf("Tool: %s\n", req.Tool))
 		if req.Target != "" {
-			s.WriteString(fmt.Sprintf("target: %s\n", req.Target))
+			s.WriteString("Target:\n")
+			s.WriteString(fmt.Sprintf("  %s\n", req.Target))
 		}
 		if req.Risk != "" {
-			s.WriteString(fmt.Sprintf("risk: %s\n", req.Risk))
+			s.WriteString(fmt.Sprintf("Risk: %s\n", req.Risk))
 		}
 		if req.Reason != "" {
-			s.WriteString(fmt.Sprintf("reason: %s\n", req.Reason))
+			s.WriteString(fmt.Sprintf("Reason: %s\n", req.Reason))
 		}
-		s.WriteString("\n[d] deny  [o] once  [s] session  [f] forever  [esc] cancel\n")
+		s.WriteString("\n")
+		s.WriteString("Choose an option:\n")
+		for i, option := range permissionOptions() {
+			s.WriteString(permissionOptionLine(option, i == m.permSelectIndex))
+			s.WriteString("\n")
+		}
+		s.WriteString("\n")
+		s.WriteString(permissionHintStyle.Render("Use ↑/↓ to select, Enter to confirm. Shortcuts: o once, s session, f forever, d deny, esc cancel"))
+		s.WriteString("\n")
 	}
 
 	return s.String()
+}
+
+func isActiveRunState(state sessionState) bool {
+	return state == stateStreaming || state == statePermissionConfirm
+}
+
+type permissionOption struct {
+	number string
+	label  string
+	choice permission.ConfirmationChoice
+	cancel bool
+}
+
+func permissionOptions() []permissionOption {
+	return []permissionOption{
+		{number: "1", label: "Allow once", choice: permission.ChoiceAllowOnce},
+		{number: "2", label: "Allow for this session", choice: permission.ChoiceAllowSession},
+		{number: "3", label: "Allow forever for this exact request", choice: permission.ChoiceAllowForever},
+		{number: "4", label: "Deny", choice: permission.ChoiceDeny},
+		{number: "5", label: "Cancel this run", cancel: true},
+	}
+}
+
+func permissionOptionLine(option permissionOption, selected bool) string {
+	line := fmt.Sprintf("%s. %s", option.number, option.label)
+	if selected {
+		return permissionSelectedStyle.Render("> " + line)
+	}
+	return permissionOptionStyle.Render("  " + line)
 }
 
 // statusBar 渲染状态栏

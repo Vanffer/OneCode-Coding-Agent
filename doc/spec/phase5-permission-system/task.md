@@ -30,7 +30,7 @@
 
 **步骤：**
 1. 定义 `Mode`、`Action`、`Scope`。
-2. 定义 `Rule`、`RuleSet`、`Config`、`RawRule`。
+2. 定义 `Rule`、`RuleSet`、`Config`，其中配置规则使用字符串列表承载原始规则。
 3. 定义 `Request`，避免依赖 `agent` 包，Agent mode 用字符串表达。
 4. 定义 `Target`、`TargetKind`。
 5. 定义 `Decision`。

@@ -77,7 +77,7 @@ LLM 返回 tool calls
   加载用户级、项目级、本地级和会话级规则，按优先级匹配工具名和参数模式。
 
 第四层：权限模式
-  Strict / Default / Permissive / Bypass 决定规则未命中时的默认行为。
+  Strict / Default / AcceptEdits / Plan / BypassPermissions 决定规则未命中时的默认行为。
 
 第五层：人在回路
   对需要用户判断的工具调用暂停执行，等用户选择后继续。
@@ -100,10 +100,11 @@ LLM 返回 tool calls
 type Mode string
 
 const (
-	ModeStrict     Mode = "strict"
-	ModeDefault    Mode = "default"
-	ModePermissive Mode = "permissive"
-	ModeBypass     Mode = "bypass"
+	ModeStrict      Mode = "strict"
+	ModeDefault     Mode = "default"
+	ModeAcceptEdits Mode = "acceptEdits"
+	ModePlan        Mode = "plan"
+	ModeBypass      Mode = "bypassPermissions"
 )
 ```
 
@@ -200,7 +201,7 @@ session -> local -> project -> user
 ```go
 type Config struct {
 	Mode  Mode
-	Rules []RawRule
+	Rules []string
 }
 ```
 
@@ -218,13 +219,7 @@ rules:
 
 `mode` 只在用户级配置或本地级配置中有意义。项目级配置可以包含 mode 字段，但实现应优先使用更靠近本机的 mode，避免团队规则强行改变用户信任档位。
 
-### permission.RawRule
-
-```go
-type RawRule string
-```
-
-`RawRule` 是 YAML 中的原始规则字符串。解析阶段会转成 `Rule`。
+`Rules` 直接保存 YAML 中的原始规则字符串。解析阶段会转成 `Rule`。
 
 选择字符串形式而不是结构体 YAML，是为了贴合用户要求的：
 
@@ -240,8 +235,7 @@ type Request struct {
 	Tool     string
 	Args     map[string]interface{}
 	Safety   tools.Safety
-	Mode     agent.Mode
-	ProjectRoot string
+	Category tools.ToolCategory
 }
 ```
 
@@ -252,11 +246,10 @@ type Request struct {
 - `ID` 对应 LLM tool call ID。
 - `Tool` 是工具名，例如 `bash`、`read_file`。
 - `Args` 是模型生成的工具参数。
-- `Safety` 是工具安全分类。
-- `Mode` 是当前 Agent 模式，用于保留 Plan Mode 禁用逻辑或解释。
-- `ProjectRoot` 是启动时确定的单一项目根。
+- `Safety` 是工具调度安全分类，用于兼容只读/有副作用调度语义。
+- `Category` 是工具权限风险类别，用于权限模式矩阵判断默认策略。
 
-为了避免 `permission` 反向依赖 `agent` 包，实际实现中可以用字符串或本地枚举表示 Agent Mode。
+Plan Mode 的硬拦截仍由 Agent Scheduler 在权限系统之前处理，项目根由 `Manager` 初始化时注入沙箱，不放进单次 `Request`。
 
 ### permission.Target
 
@@ -302,7 +295,7 @@ type Decision struct {
 	Reason  string
 	Scope   Scope
 	Rule    *Rule
-	Request ConfirmationRequest
+	Confirm *ConfirmationRequest
 }
 ```
 
@@ -310,7 +303,7 @@ type Decision struct {
 
 - `Action=allow`：可以执行工具。
 - `Action=deny`：不执行工具，`Reason` 写入工具错误结果。
-- `Action=ask`：需要把 `Request` 发给 TUI 进行确认。
+- `Action=ask`：需要把 `Confirm` 指向的确认请求发给 TUI。
 
 ### permission.ConfirmationRequest
 
@@ -621,7 +614,7 @@ decision = Authorize(req)
 if decision != ask:
     return decision
 
-response = confirmer.Confirm(decision.Request)
+response = confirmer.Confirm(decision.Confirm)
 switch response.choice:
   deny:
     return deny
@@ -641,27 +634,30 @@ switch response.choice:
 
 ```text
 Strict:
-  read_file / glob / grep -> ask
-  write_file / edit_file / bash -> ask
+  read / write / command / network / mcp / unknown -> ask
 
 Default:
-  read_file / glob / grep -> allow
-  write_file / edit_file / bash -> ask
+  read -> allow
+  write / command / network / mcp / unknown -> ask
 
-Permissive:
-  read_file / glob / grep -> allow
-  write_file / edit_file -> allow
-  bash -> ask
+AcceptEdits:
+  read / write -> allow
+  command / network / mcp / unknown -> ask
 
-Bypass:
-  read_file / glob / grep -> allow
-  write_file / edit_file / bash -> allow
+Plan:
+  read -> allow
+  write / command / network / mcp / unknown -> deny
+
+BypassPermissions:
+  read / write / command / network / mcp -> allow
+  unknown -> ask
 ```
 
 注意：
 
 - 以上策略只在规则未命中时生效。
 - 黑名单和沙箱永远先执行。
+- BypassPermissions 仍不会绕过黑名单、路径沙箱和显式 deny 规则。
 - Plan Mode 禁用工具仍由 Agent mode 层处理，不被权限模式改变。
 
 **规则匹配策略：**
@@ -1375,7 +1371,7 @@ doc/
 | 规则匹配 | 无 glob 元字符则精确匹配，有 glob 元字符则 glob 匹配 | 避免 `git status` 意外匹配 `git status --short` |
 | 规则优先级 | session > local > project > user > mode | 符合最终确认的优先级，本机/会话规则可覆盖共享规则 |
 | 永久允许 | 只写本地级规则，且生成精确匹配 | 避免交互中污染团队共享策略，也避免自动扩大权限 |
-| 权限模式 | 固定 Strict / Default / Permissive / Bypass | 满足四档信任等级，不做自定义档位 |
+| 权限模式 | 固定 Strict / Default / AcceptEdits / Plan / BypassPermissions | 满足固定信任等级，不做自定义档位 |
 | Mode 冲突 | 本地级 mode 优先，其次用户级；项目级 mode 不强制覆盖 | 权限偏好更像个人/本机信任设置，不应由项目默认强推 |
 | 人在回路 | 用 `Confirmer` 接口解耦 permission 和 TUI | 权限核心可测试，UI 可替换 |
 | TUI 确认 UI | 新增确认状态或 pendingPermission 字段，快捷键选择 | 初版简单可靠，不做复杂编辑器 |

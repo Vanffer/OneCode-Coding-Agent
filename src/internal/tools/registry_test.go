@@ -140,16 +140,14 @@ func TestRegistryRegisterWithSafety(t *testing.T) {
 	}
 }
 
-func TestRegistryRegisterWithSafetyAndCategory(t *testing.T) {
+func TestRegistryHas(t *testing.T) {
 	registry := NewRegistry()
-	registry.RegisterWithSafetyAndCategory(registryTestTool{name: "custom_network"}, SafetySideEffect, CategoryNetwork)
-
-	category, ok := registry.Category("custom_network")
-	if !ok {
-		t.Fatal("expected custom tool to be registered")
+	if registry.Has("custom") {
+		t.Fatal("expected empty registry to not have custom tool")
 	}
-	if category != CategoryNetwork {
-		t.Fatalf("expected network category, got %s", category)
+	registry.RegisterWithSafety(registryTestTool{name: "custom"}, SafetyReadOnly)
+	if !registry.Has("custom") {
+		t.Fatal("expected registered tool to be present")
 	}
 }
 

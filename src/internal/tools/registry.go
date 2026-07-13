@@ -61,6 +61,12 @@ func (r *Registry) Get(name string) (Tool, bool) {
 	return info.Tool, true
 }
 
+// Has reports whether a tool name is already registered.
+func (r *Registry) Has(name string) bool {
+	_, ok := r.tools[name]
+	return ok
+}
+
 // Safety 返回工具安全分类。
 func (r *Registry) Safety(name string) (Safety, bool) {
 	info, ok := r.tools[name]

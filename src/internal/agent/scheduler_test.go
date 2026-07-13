@@ -156,6 +156,31 @@ func TestSchedulerRejectsDisabledToolInPlanMode(t *testing.T) {
 	}
 }
 
+func TestSchedulerMCPToolSafetyInPlanMode(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.RegisterWithSafety(&fakeTool{name: "github.write_issue"}, tools.SafetySideEffect)
+	registry.RegisterWithSafety(&fakeTool{name: "github.search_issues"}, tools.SafetyReadOnly)
+	agent := New(nil, registry)
+
+	results, bad := agent.executeToolCalls(context.Background(), []llm.ToolCall{
+		{ID: "write", Name: "github.write_issue", Input: map[string]interface{}{}},
+		{ID: "search", Name: "github.search_issues", Input: map[string]interface{}{}},
+	}, ModePlan, make(chan Event, 20))
+
+	if bad != 1 {
+		t.Fatalf("expected one side-effect MCP tool to be rejected, got %d", bad)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %+v", results)
+	}
+	if !results[0].IsError {
+		t.Fatalf("expected side-effect MCP tool to be rejected, got %+v", results[0])
+	}
+	if results[1].IsError || results[1].Content != "ok" {
+		t.Fatalf("expected read-only MCP tool to execute, got %+v", results[1])
+	}
+}
+
 func TestSchedulerUnknownTool(t *testing.T) {
 	agent := New(nil, tools.NewRegistry())
 

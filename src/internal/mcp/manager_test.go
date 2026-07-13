@@ -163,6 +163,9 @@ func TestManagerRegisterTools(t *testing.T) {
 	if safety, ok := registry.Safety("github.search"); !ok || safety != tools.SafetyReadOnly {
 		t.Fatalf("expected read-only safety, got %v ok=%v", safety, ok)
 	}
+	if category, ok := registry.Category("github.search"); !ok || category != tools.CategoryMCP {
+		t.Fatalf("expected MCP category, got %v ok=%v", category, ok)
+	}
 }
 
 func TestManagerRegisterToolConflict(t *testing.T) {

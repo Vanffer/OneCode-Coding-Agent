@@ -100,7 +100,7 @@ func (m *Manager) RegisterTools(registry *tools.Registry, result *DiscoverResult
 				result.Errors = append(result.Errors, ServerError{Server: session.Name, Stage: StageRegister, Err: err})
 				continue
 			}
-			registry.RegisterWithSafety(tool, SafetyForMCPTool(session.Config, remote.Name))
+			registry.RegisterWithSafetyAndCategory(tool, SafetyForMCPTool(session.Config, remote.Name), tools.CategoryMCP)
 		}
 	}
 }

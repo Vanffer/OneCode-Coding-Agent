@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,11 +24,14 @@ import (
 type sessionState int
 
 const (
-	stateSelecting         sessionState = iota // 多 provider 时的选择界面
-	stateIdle                                  // 等待用户输入
-	stateStreaming                             // 等待/接收模型流（spinner+计时）
-	statePermissionConfirm                     // 等待用户确认工具权限
+	stateSelecting          sessionState = iota // 多 provider 时的选择界面
+	stateIdle                                   // 等待用户输入
+	stateStreaming                              // 等待/接收模型流（spinner+计时）
+	statePermissionConfirm                      // 等待用户确认工具权限
+	stateContextWindowInput                     // 输入上下文窗口大小
 )
+
+const mainInputPlaceholder = "Send a message..."
 
 // Model 是 TUI 的主模型
 type Model struct {
@@ -46,9 +50,12 @@ type Model struct {
 	cancelCurrent   context.CancelFunc // 当前 agent run 的取消函数
 	pendingPerm     *agent.PermissionEvent
 	permSelectIndex int
-	pendingPlan     *PendingPlan     // /plan 生成、/do 消费的待执行计划
-	currentMode     agent.Mode       // 当前运行模式
-	progressStatus  string           // Agent 进度状态栏文案
+	pendingPlan     *PendingPlan // /plan 生成、/do 消费的待执行计划
+	currentMode     agent.Mode   // 当前运行模式
+	progressStatus  string       // Agent 进度状态栏文案
+	contextUsage    conversation.UsageEstimate
+	contextWindow   conversation.WindowInfo
+	contextStatus   string
 	curReply        *strings.Builder // 本轮 assistant 增量缓冲
 	pendingChars    int              // 待渲染字符数（用于批量更新）
 	pendingMarkdown string           // 待打印的 markdown
@@ -78,7 +85,7 @@ type doneMsg struct{}
 func New(providers []config.ProviderConfig, registry *tools.Registry, projectRoot string) Model {
 	// 创建 textarea
 	ta := textarea.New()
-	ta.Placeholder = "Send a message..."
+	ta.Placeholder = mainInputPlaceholder
 	ta.Focus()
 	ta.CharLimit = 0
 	ta.SetWidth(80)
@@ -104,7 +111,7 @@ func New(providers []config.ProviderConfig, registry *tools.Registry, projectRoo
 		p, err := llm.New(providers[0])
 		if err == nil {
 			provider = p
-			ag, initErr = newAgent(provider, registry, projectRoot)
+			ag, initErr = newAgent(provider, registry, projectRoot, providers[0].ContextWindow)
 			if initErr == nil {
 				state = stateIdle
 			}
@@ -113,25 +120,32 @@ func New(providers []config.ProviderConfig, registry *tools.Registry, projectRoo
 		}
 	}
 
+	conv := conversation.New(conversation.WithContextOptions(conversation.ContextOptions{
+		ProjectRoot: projectRoot,
+	}))
+	contextState := conv.ContextState()
+
 	return Model{
-		state:       state,
-		textarea:    ta,
-		spinner:     s,
-		renderer:    renderer,
-		providers:   providers,
-		provider:    provider,
-		agent:       ag,
-		registry:    registry,
-		projectRoot: projectRoot,
-		conv:        conversation.New(),
-		curReply:    &strings.Builder{},
-		width:       80,
-		height:      24,
-		err:         initErr,
+		state:         state,
+		textarea:      ta,
+		spinner:       s,
+		renderer:      renderer,
+		providers:     providers,
+		provider:      provider,
+		agent:         ag,
+		registry:      registry,
+		projectRoot:   projectRoot,
+		conv:          conv,
+		contextUsage:  contextState.Usage,
+		contextWindow: contextState.Window,
+		curReply:      &strings.Builder{},
+		width:         80,
+		height:        24,
+		err:           initErr,
 	}
 }
 
-func newAgent(provider llm.Provider, registry *tools.Registry, projectRoot string) (*agent.Agent, error) {
+func newAgent(provider llm.Provider, registry *tools.Registry, projectRoot string, providerWindow int) (*agent.Agent, error) {
 	if projectRoot == "" {
 		projectRoot = "."
 	}
@@ -142,7 +156,15 @@ func newAgent(provider llm.Provider, registry *tools.Registry, projectRoot strin
 	if err != nil {
 		return nil, err
 	}
-	return agent.New(provider, registry, agent.WithPermissionManager(manager)), nil
+	return agent.New(provider, registry,
+		agent.WithPermissionManager(manager),
+		agent.WithContextOptions(conversation.ContextOptions{
+			ProjectRoot:    projectRoot,
+			ProviderName:   provider.Name(),
+			ModelName:      provider.Model(),
+			ProviderWindow: providerWindow,
+		}),
+	), nil
 }
 
 // Init 初始化模型
@@ -218,7 +240,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 				m.provider = provider
-				ag, err := newAgent(provider, m.registry, m.projectRoot)
+				ag, err := newAgent(provider, m.registry, m.projectRoot, selected.ContextWindow)
 				if err != nil {
 					m.err = err
 					return m, tea.Quit
@@ -273,6 +295,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return next, cmd
 			}
 			return m, nil
+		}
+
+		if m.state == stateContextWindowInput {
+			switch msg.String() {
+			case "enter":
+				next, cmd := m.applyContextWindowInput()
+				return next, cmd
+			case "esc":
+				m.state = stateIdle
+				m.textarea.Reset()
+				m.textarea.Placeholder = mainInputPlaceholder
+				m.textarea.Focus()
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.textarea, cmd = m.textarea.Update(msg)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
 		}
 
 		// 处理 idle 状态的输入
@@ -330,7 +370,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.PasteMsg:
 		// 粘贴内容传递给 textarea
-		if m.state == stateIdle {
+		if m.state == stateIdle || m.state == stateContextWindowInput {
 			var cmd tea.Cmd
 			m.textarea, cmd = m.textarea.Update(msg)
 			cmds = append(cmds, cmd)
@@ -423,6 +463,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
 
+		case agent.EventContext:
+			if msg.Context != nil {
+				m.contextUsage = msg.Context.Usage
+				state := m.conv.ContextState()
+				m.contextWindow = state.Window
+				m.contextStatus = msg.Context.Message
+				if shouldPrintContextEvent(msg.Context.Kind) && msg.Context.Message != "" {
+					cmds = append(cmds, tea.Println(fmt.Sprintf("\n%s\n", msg.Context.Message)))
+				}
+			}
+			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
+
 		case agent.EventCancelled:
 			m.progressStatus = "Cancelled"
 			cmds = append(cmds, tea.Println("\n任务已取消"))
@@ -479,6 +531,25 @@ func (m Model) handleSlashCommand(input string) (Model, tea.Cmd, bool) {
 	case input == "/exit":
 		return m, tea.Quit, true
 
+	case input == "/compact":
+		next, cmd := m.startCompactRun()
+		return next, cmd, true
+
+	case input == "/context":
+		return m, tea.Println("\n" + m.contextInfo() + "\n"), true
+
+	case strings.HasPrefix(input, "/context window"):
+		value := strings.TrimSpace(strings.TrimPrefix(input, "/context window"))
+		if value != "" {
+			next, cmd := m.setContextWindow(value)
+			return next, cmd, true
+		}
+		m.state = stateContextWindowInput
+		m.textarea.Reset()
+		m.textarea.Placeholder = "Context window tokens, e.g. 200000"
+		m.textarea.Focus()
+		return m, nil, true
+
 	case strings.HasPrefix(input, "/plan"):
 		target := strings.TrimSpace(strings.TrimPrefix(input, "/plan"))
 		if target == "" {
@@ -513,6 +584,49 @@ func (m Model) startAgentRun(input string, mode agent.Mode, opts agent.RunOption
 	m.state = stateStreaming
 
 	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+}
+
+func (m Model) startCompactRun() (Model, tea.Cmd) {
+	if m.agent == nil {
+		m.err = fmt.Errorf("no provider selected")
+		return m, tea.Quit
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelCurrent = cancel
+	m.currentMode = agent.ModeExecute
+	m.progressStatus = "正在压缩上下文"
+	m.agentEvents = m.agent.Compact(ctx, m.conv, conversation.CompactModeManual)
+	m.curReply.Reset()
+	m.turnStart = time.Now()
+	m.state = stateStreaming
+	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+}
+
+func (m Model) applyContextWindowInput() (Model, tea.Cmd) {
+	value := strings.TrimSpace(m.textarea.Value())
+	m.textarea.Reset()
+	m.textarea.Placeholder = mainInputPlaceholder
+	m.textarea.Focus()
+	return m.setContextWindow(value)
+}
+
+func (m Model) setContextWindow(value string) (Model, tea.Cmd) {
+	limit, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || limit <= 0 {
+		m.state = stateIdle
+		return m, tea.Println("\n请输入正整数上下文窗口大小，例如 /context window 200000")
+	}
+	window, err := m.conv.SetContextWindow(context.Background(), limit)
+	if err != nil {
+		m.state = stateIdle
+		return m, tea.Println(fmt.Sprintf("\n设置上下文窗口失败: %s", err.Error()))
+	}
+	state := m.conv.ContextState()
+	m.contextWindow = window
+	m.contextUsage = state.Usage
+	m.contextStatus = "上下文窗口已更新"
+	m.state = stateIdle
+	return m, tea.Println(fmt.Sprintf("\n上下文窗口已设置为 %s", formatTokens(limit)))
 }
 
 func (m Model) cancelAgentRun() (Model, tea.Cmd) {
@@ -590,6 +704,8 @@ func (m Model) View() tea.View {
 		return tea.NewView(m.viewStreaming())
 	case statePermissionConfirm:
 		return tea.NewView(m.viewPermissionConfirm())
+	case stateContextWindowInput:
+		return tea.NewView(m.viewContextWindowInput())
 	default:
 		return tea.NewView("")
 	}
@@ -617,7 +733,7 @@ func (m Model) viewIdle() string {
 	var s strings.Builder
 
 	// 状态栏
-	s.WriteString(statusBar(m.provider, "Ready", m.width))
+	s.WriteString(statusBar(m.provider, "Ready", m.contextDisplay(), m.width))
 	s.WriteString("\n")
 
 	// 输入框
@@ -636,7 +752,7 @@ func (m Model) viewStreaming() string {
 	if m.progressStatus != "" {
 		status = fmt.Sprintf("%s %s %.1fs", m.spinner.View(), m.progressStatus, elapsed)
 	}
-	s.WriteString(statusBar(m.provider, status, m.width))
+	s.WriteString(statusBar(m.provider, status, m.contextDisplay(), m.width))
 	s.WriteString("\n")
 
 	// 显示当前流式内容（原始文本，不渲染 markdown）
@@ -657,7 +773,7 @@ func (m Model) viewPermissionConfirm() string {
 
 	elapsed := time.Since(m.turnStart).Seconds()
 	status := fmt.Sprintf("%s Permission %.1fs", m.spinner.View(), elapsed)
-	s.WriteString(statusBar(m.provider, status, m.width))
+	s.WriteString(statusBar(m.provider, status, m.contextDisplay(), m.width))
 	s.WriteString("\n")
 
 	if m.curReply.Len() > 0 {
@@ -697,6 +813,16 @@ func (m Model) viewPermissionConfirm() string {
 	return s.String()
 }
 
+func (m Model) viewContextWindowInput() string {
+	var s strings.Builder
+	s.WriteString(statusBar(m.provider, "Set context window", m.contextDisplay(), m.width))
+	s.WriteString("\n")
+	s.WriteString("❯ ")
+	s.WriteString(m.textarea.View())
+	s.WriteString("\n")
+	return s.String()
+}
+
 func isActiveRunState(state sessionState) bool {
 	return state == stateStreaming || state == statePermissionConfirm
 }
@@ -726,17 +852,94 @@ func permissionOptionLine(option permissionOption, selected bool) string {
 	return permissionOptionStyle.Render("  " + line)
 }
 
+func (m Model) contextDisplay() string {
+	state := m.conv.ContextState()
+	window := m.contextWindow
+	if window.Limit <= 0 {
+		window = state.Window
+	}
+	usage := m.contextUsage
+	if usage.Limit <= 0 {
+		usage = state.Usage
+	}
+	limit := usage.Limit
+	if limit <= 0 {
+		limit = window.Limit
+	}
+	used := usage.Used
+	percent := usage.Percent
+	if percent == 0 && limit > 0 && used > 0 {
+		percent = used * 100 / limit
+	}
+	approx := usage.Estimated || window.Source == conversation.WindowSourceInferred || window.Source == conversation.WindowSourceDefault
+	prefix := ""
+	if approx {
+		prefix = "~"
+	}
+	return fmt.Sprintf("Context %s%s / %s · %d%%", prefix, formatTokens(used), formatTokens(limit), percent)
+}
+
+func (m Model) contextInfo() string {
+	state := m.conv.ContextState()
+	window := m.contextWindow
+	if window.Limit <= 0 {
+		window = state.Window
+	}
+	return fmt.Sprintf(
+		"Context: %s\nWindow: %s (%s)\nStatus: %s\nUse /context window 200000 to set a project-local window.",
+		m.contextDisplay(),
+		formatTokens(window.Limit),
+		windowSourceText(window.Source),
+		emptyStatus(m.contextStatus),
+	)
+}
+
+func formatTokens(value int) string {
+	if value >= 1000 {
+		return fmt.Sprintf("%dk", value/1000)
+	}
+	return fmt.Sprintf("%d", value)
+}
+
+func windowSourceText(source conversation.WindowSource) string {
+	switch source {
+	case conversation.WindowSourceLocal:
+		return "local"
+	case conversation.WindowSourceProvider:
+		return "provider"
+	case conversation.WindowSourceInferred:
+		return "estimated"
+	default:
+		return "default"
+	}
+}
+
+func emptyStatus(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "Ready"
+	}
+	return value
+}
+
+func shouldPrintContextEvent(kind agent.ContextEventKind) bool {
+	return kind != agent.ContextUsageUpdated
+}
+
 // statusBar 渲染状态栏
-func statusBar(provider llm.Provider, status string, width int) string {
+func statusBar(provider llm.Provider, status string, contextText string, width int) string {
 	if provider == nil {
 		return ""
 	}
 	left := fmt.Sprintf(" %s ", provider.Name())
 	right := fmt.Sprintf(" %s ", provider.Model())
 	middle := fmt.Sprintf(" %s ", status)
+	contextPart := ""
+	if strings.TrimSpace(contextText) != "" {
+		contextPart = fmt.Sprintf(" %s ", contextText)
+	}
 
 	// 计算填充
-	padding := width - len(left) - len(right) - len(middle)
+	padding := width - len(left) - len(right) - len(middle) - len(contextPart)
 	if padding < 0 {
 		padding = 0
 	}
@@ -745,7 +948,7 @@ func statusBar(provider llm.Provider, status string, width int) string {
 		statusBarLeftStyle.Render(left),
 		statusBarMiddleStyle.Render(middle),
 		statusBarRightStyle.Render(strings.Repeat(" ", padding)),
+		statusBarRightStyle.Render(contextPart),
 		statusBarRightStyle.Render(right),
-		"",
 	)
 }

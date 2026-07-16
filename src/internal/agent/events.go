@@ -1,6 +1,9 @@
 package agent
 
-import "onecode/internal/permission"
+import (
+	"onecode/internal/conversation"
+	"onecode/internal/permission"
+)
 
 // Mode 表示 Agent 本次运行处于哪种工具开放策略。
 type Mode int
@@ -39,6 +42,7 @@ const (
 	EventError
 	EventCancelled
 	EventPermissionRequest
+	EventContext
 )
 
 // Event 是 Agent 和 TUI 之间唯一的异步通信载体。
@@ -50,6 +54,7 @@ type Event struct {
 	Progress   *ProgressEvent
 	Done       *DoneEvent
 	Permission *PermissionEvent
+	Context    *ContextEvent
 	Err        error
 }
 
@@ -77,6 +82,26 @@ type UsageEvent struct {
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
 }
+
+// ContextEvent 表示上下文管理状态变化。
+type ContextEvent struct {
+	Kind    ContextEventKind
+	Message string
+	Usage   conversation.UsageEstimate
+}
+
+// ContextEventKind 标识上下文管理事件类型。
+type ContextEventKind int
+
+const (
+	ContextUsageUpdated ContextEventKind = iota
+	ContextToolResultStored
+	ContextCompactStarted
+	ContextCompactCompleted
+	ContextCompactFailed
+	ContextCompactFuseTripped
+	ContextEmergencyRetry
+)
 
 // ProgressStatus 表示 Agent loop 当前阶段。
 type ProgressStatus int

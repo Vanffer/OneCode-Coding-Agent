@@ -134,3 +134,59 @@ func TestConversationEmpty(t *testing.T) {
 		t.Fatalf("expected 0 messages, got %d", len(msgs))
 	}
 }
+
+func TestConversationContextStateDefault(t *testing.T) {
+	conv := New()
+
+	state := conv.ContextState()
+	if state.Window.Limit != defaultContextWindow {
+		t.Fatalf("expected default window %d, got %d", defaultContextWindow, state.Window.Limit)
+	}
+	if state.Window.Source != WindowSourceDefault {
+		t.Fatalf("expected default window source, got %v", state.Window.Source)
+	}
+	if state.Store == nil {
+		t.Fatal("expected project store to be initialized")
+	}
+	if state.Files == nil {
+		t.Fatal("expected file index to be initialized")
+	}
+}
+
+func TestConversationContextStateWithOptions(t *testing.T) {
+	conv := New(WithContextOptions(ContextOptions{
+		ProjectRoot:    "/tmp/project",
+		ProviderWindow: 200000,
+	}))
+
+	state := conv.ContextState()
+	if state.ProjectRoot != "/tmp/project" {
+		t.Fatalf("expected project root, got %q", state.ProjectRoot)
+	}
+	if state.Window.Limit != 200000 {
+		t.Fatalf("expected provider window 200000, got %d", state.Window.Limit)
+	}
+	if state.Window.Source != WindowSourceProvider {
+		t.Fatalf("expected provider window source, got %v", state.Window.Source)
+	}
+	if state.Store == nil || state.Store.ProjectRoot != "/tmp/project" {
+		t.Fatalf("expected store project root to be initialized, got %+v", state.Store)
+	}
+}
+
+func TestConversationClearResetsContextRuntimeState(t *testing.T) {
+	conv := New()
+	conv.AddUser("hello")
+	conv.context.Usage = UsageEstimate{Used: 10, Limit: 100, Percent: 10}
+	conv.context.Fuse = CompactFuse{ConsecutiveFailures: 2, Tripped: true}
+
+	conv.Clear()
+
+	if conv.MessageCount() != 0 {
+		t.Fatalf("expected messages to be cleared, got %d", conv.MessageCount())
+	}
+	state := conv.ContextState()
+	if state.Usage.Used != 0 || state.Fuse.ConsecutiveFailures != 0 || state.Fuse.Tripped {
+		t.Fatalf("expected runtime context state to be reset, got usage=%+v fuse=%+v", state.Usage, state.Fuse)
+	}
+}

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
@@ -311,6 +312,161 @@ func TestPromptPayloadByMode(t *testing.T) {
 	}
 }
 
+func TestLoopUsageAnchorIncludesAssistantMessage(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{
+			{Text: "done"},
+			{Usage: &llm.Usage{TotalTokens: 42, Available: true}},
+			{Done: true, FinishReason: llm.FinishStop},
+		}},
+	}}
+	conv := conversation.New()
+	conv.AddUser("hello")
+
+	events := drainEvents(New(provider, tools.NewRegistry()).Run(context.Background(), conv, RunOptions{Mode: ModeExecute}))
+
+	state := conv.ContextState()
+	if state.Usage.Anchor.MessageCount != 2 {
+		t.Fatalf("expected anchor to include user and assistant messages, got %+v", state.Usage.Anchor)
+	}
+	if state.Usage.Used != 42 || state.Usage.Estimated {
+		t.Fatalf("expected provider usage to anchor context state, got %+v", state.Usage)
+	}
+	if !hasContextUsage(events, 42) {
+		t.Fatalf("expected context usage event with anchored usage, got %+v", events)
+	}
+}
+
+func TestLoopUsageAnchorIncludesAssistantToolCallBeforeToolResult(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{
+			{ToolCall: &llm.ToolCall{ID: "read", Name: "read_file", Input: map[string]interface{}{"path": "a.go"}}},
+			{Usage: &llm.Usage{TotalTokens: 50, Available: true}},
+			{Done: true, FinishReason: llm.FinishToolCalls},
+		}},
+	}}
+	registry := tools.NewRegistry()
+	registry.RegisterWithSafety(&fakeTool{name: "read_file", result: "file"}, tools.SafetyReadOnly)
+	conv := conversation.New()
+	conv.AddUser("read")
+
+	drainEvents(New(provider, registry).Run(context.Background(), conv, RunOptions{Mode: ModeExecute, MaxIterations: 1}))
+
+	state := conv.ContextState()
+	if state.Usage.Anchor.MessageCount != 2 {
+		t.Fatalf("expected anchor to include user and assistant tool call only, got %+v", state.Usage.Anchor)
+	}
+	if conv.MessageCount() != 3 {
+		t.Fatalf("expected tool result to be appended after anchor, got %d messages", conv.MessageCount())
+	}
+}
+
+func TestLoopPostToolResultsAutoCompactsBeforeNextIteration(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{
+			{ToolCall: &llm.ToolCall{ID: "read", Name: "read_file", Input: map[string]interface{}{"path": "a.go"}}},
+			{Usage: &llm.Usage{TotalTokens: 85, Available: true}},
+			{Done: true, FinishReason: llm.FinishToolCalls},
+		}},
+		{events: []llm.StreamEvent{
+			{Text: "<formal_summary>## Task Goal\nContinue.</formal_summary>"},
+			{Done: true, FinishReason: llm.FinishStop},
+		}},
+	}}
+	registry := tools.NewRegistry()
+	registry.RegisterWithSafety(&fakeTool{name: "read_file", result: "file"}, tools.SafetyReadOnly)
+	conv := conversation.New()
+	conv.AddUser("read")
+	agent := New(provider, registry, WithContextOptions(conversation.ContextOptions{
+		ProjectRoot:              t.TempDir(),
+		ProviderWindow:           100,
+		SummaryReserveTokens:     10,
+		AutoSafetyMarginTokens:   10,
+		ForceSafetyMarginTokens:  1,
+		ToolResultMaxTokens:      10000,
+		ToolResultBatchMaxTokens: 10000,
+	}))
+
+	events := drainEvents(agent.Run(context.Background(), conv, RunOptions{Mode: ModeExecute, MaxIterations: 1}))
+
+	if provider.callCount() != 2 {
+		t.Fatalf("expected normal request and post-tool compact request, got %d calls", provider.callCount())
+	}
+	if len(provider.callAt(1).tools) != 0 {
+		t.Fatalf("expected compact request without tools, got %+v", provider.callAt(1).tools)
+	}
+	if !hasContextEvent(events, ContextCompactCompleted) {
+		t.Fatalf("expected post-tool compact completed event, got %+v", events)
+	}
+	if len(conv.Messages()) != 1 || !containsSystemSummaryBoundary(conv.Messages()[0].Content) {
+		t.Fatalf("expected conversation to be compacted before next iteration, got %+v", conv.Messages())
+	}
+}
+
+func TestLoopEmergencyCompactAndRetry(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{err: &llm.ContextTooLongError{Message: "too long"}},
+		{events: []llm.StreamEvent{
+			{Text: "<formal_summary>## Task Goal\nContinue.</formal_summary>"},
+			{Done: true, FinishReason: llm.FinishStop},
+		}},
+		{events: []llm.StreamEvent{
+			{Text: "done"},
+			{Done: true, FinishReason: llm.FinishStop},
+		}},
+	}}
+	conv := conversation.New()
+	conv.AddUser("do it")
+	agent := New(provider, tools.NewRegistry(), WithContextOptions(conversation.ContextOptions{
+		ProjectRoot: t.TempDir(),
+	}))
+
+	events := drainEvents(agent.Run(context.Background(), conv, RunOptions{Mode: ModeExecute}))
+
+	if provider.callCount() != 3 {
+		t.Fatalf("expected original request, compact request, and retry; got %d calls", provider.callCount())
+	}
+	done := lastDone(events)
+	if done == nil || done.Reason != StopModelDone {
+		t.Fatalf("expected successful retry, got done=%+v events=%+v", done, events)
+	}
+	if !hasContextEvent(events, ContextEmergencyRetry) {
+		t.Fatalf("expected emergency retry context event, got %+v", events)
+	}
+	if len(conv.Messages()) != 2 || !containsSystemSummaryBoundary(conv.Messages()[0].Content) || conv.Messages()[1].Content != "done" {
+		t.Fatalf("expected compacted context plus final assistant, got %+v", conv.Messages())
+	}
+}
+
+func TestLoopEmergencyCompactRetryOnlyOnce(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{err: &llm.ContextTooLongError{Message: "too long"}},
+		{events: []llm.StreamEvent{
+			{Text: "<formal_summary>## Task Goal\nContinue.</formal_summary>"},
+			{Done: true, FinishReason: llm.FinishStop},
+		}},
+		{err: &llm.ContextTooLongError{Message: "still too long"}},
+	}}
+	conv := conversation.New()
+	conv.AddUser("do it")
+	agent := New(provider, tools.NewRegistry(), WithContextOptions(conversation.ContextOptions{
+		ProjectRoot: t.TempDir(),
+	}))
+
+	events := drainEvents(agent.Run(context.Background(), conv, RunOptions{Mode: ModeExecute}))
+
+	if provider.callCount() != 3 {
+		t.Fatalf("expected exactly one retry after emergency compact, got %d calls", provider.callCount())
+	}
+	done := lastDone(events)
+	if done == nil || done.Reason != StopStreamError {
+		t.Fatalf("expected stream error after retry failure, got %+v", done)
+	}
+	if !hasEventError(events) {
+		t.Fatalf("expected error event, got %+v", events)
+	}
+}
+
 func drainEvents(ch <-chan Event) []Event {
 	var events []Event
 	for event := range ch {
@@ -340,4 +496,35 @@ func hasReminderKind(payload prompt.Payload, kind prompt.ReminderKind) bool {
 func containsSystemReminder(content string) bool {
 	return len(content) >= len("<system-reminder>") && (content == "<system-reminder>" ||
 		content[:len("<system-reminder>")] == "<system-reminder>")
+}
+
+func hasContextEvent(events []Event, kind ContextEventKind) bool {
+	for _, event := range events {
+		if event.Type == EventContext && event.Context != nil && event.Context.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func hasContextUsage(events []Event, used int) bool {
+	for _, event := range events {
+		if event.Type == EventContext && event.Context != nil && event.Context.Usage.Used == used {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEventError(events []Event) bool {
+	for _, event := range events {
+		if event.Type == EventError && event.Err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSystemSummaryBoundary(content string) bool {
+	return strings.Contains(content, "<context-summary-boundary>")
 }

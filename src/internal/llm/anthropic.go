@@ -72,7 +72,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 		maxTokens := defaultAnthropicMaxOutputTokens
 
 		params := anthropic.MessageNewParams{
-			Model:     p.cfg.Model,
+			Model:     requestModelName(p.cfg.Model),
 			MaxTokens: maxTokens,
 			System:    systemBlocks,
 			Messages:  messages,

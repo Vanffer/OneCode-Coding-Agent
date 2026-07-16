@@ -23,6 +23,7 @@ type Agent struct {
 	promptRuntime       *prompt.Runtime
 	permissionManager   *permission.Manager
 	permissionResponses chan permission.ConfirmationResponse
+	contextOptions      conversation.ContextOptions
 }
 
 // Option customizes an Agent.
@@ -42,6 +43,12 @@ func WithPermissionManager(manager *permission.Manager) Option {
 	}
 }
 
+func WithContextOptions(opts conversation.ContextOptions) Option {
+	return func(a *Agent) {
+		a.contextOptions = opts
+	}
+}
+
 // New 创建 Agent。
 func New(p llm.Provider, r *tools.Registry, opts ...Option) *Agent {
 	a := &Agent{
@@ -56,6 +63,19 @@ func New(p llm.Provider, r *tools.Registry, opts ...Option) *Agent {
 		}
 	}
 	return a
+}
+
+func (a *Agent) conversationContextOptions() conversation.ContextOptions {
+	opts := a.contextOptions
+	if a.provider != nil {
+		if opts.ProviderName == "" {
+			opts.ProviderName = a.provider.Name()
+		}
+		if opts.ModelName == "" {
+			opts.ModelName = a.provider.Model()
+		}
+	}
+	return opts
 }
 
 func (a *Agent) RespondPermission(response permission.ConfirmationResponse) {
@@ -82,6 +102,24 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, opts R
 		a.runLoop(ctx, conv, opts, events)
 	}()
 
+	return events
+}
+
+func (a *Agent) Compact(ctx context.Context, conv *conversation.Conversation, mode conversation.CompactMode) <-chan Event {
+	events := make(chan Event, 16)
+	go func() {
+		defer close(events)
+		result, err := conv.Compact(ctx, providerCompressor{
+			provider: a.provider,
+		}, mode, a.conversationContextOptions())
+		sendContextStatuses(ctx, events, result.Statuses)
+		if err != nil {
+			sendEvent(ctx, events, Event{Type: EventError, Err: err})
+			sendEvent(ctx, events, Event{Type: EventDone, Done: &DoneEvent{Reason: StopStreamError}})
+			return
+		}
+		sendEvent(ctx, events, Event{Type: EventDone, Done: &DoneEvent{Reason: StopModelDone}})
+	}()
 	return events
 }
 

@@ -11,12 +11,13 @@ import (
 
 // ProviderConfig 定义单个 LLM Provider 的配置
 type ProviderConfig struct {
-	Name     string `yaml:"name"`     // 状态栏左侧显示
-	Protocol string `yaml:"protocol"` // "anthropic" | "openai"
-	BaseURL  string `yaml:"base_url"` // 空则用 SDK 默认端点
-	APIKey   string `yaml:"api_key"`
-	Model    string `yaml:"model"`    // 状态栏右侧显示
-	Thinking bool   `yaml:"thinking"` // 仅 anthropic 生效
+	Name          string `yaml:"name"`     // 状态栏左侧显示
+	Protocol      string `yaml:"protocol"` // "anthropic" | "openai"
+	BaseURL       string `yaml:"base_url"` // 空则用 SDK 默认端点
+	APIKey        string `yaml:"api_key"`
+	Model         string `yaml:"model"`          // 状态栏右侧显示
+	Thinking      bool   `yaml:"thinking"`       // 仅 anthropic 生效
+	ContextWindow int    `yaml:"context_window"` // 可选：上下文窗口 token 上限
 }
 
 // Config 应用配置
@@ -139,6 +140,9 @@ func validateProviders(providers []ProviderConfig, required bool) error {
 		}
 		if p.Model == "" {
 			return fmt.Errorf("配置错误: providers[%d] (%s).model 为空", i, p.Name)
+		}
+		if p.ContextWindow < 0 {
+			return fmt.Errorf("配置错误: providers[%d] (%s).context_window 必须为正数", i, p.Name)
 		}
 	}
 

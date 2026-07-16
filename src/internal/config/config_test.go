@@ -139,6 +139,56 @@ providers:
 	}
 }
 
+func TestLoadProviderContextWindow(t *testing.T) {
+	path := writeTempFile(t, `
+providers:
+  - name: Claude
+    protocol: anthropic
+    api_key: test-key
+    model: claude-3-sonnet
+    context_window: 200000
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cfg.Providers[0].ContextWindow; got != 200000 {
+		t.Fatalf("expected context window 200000, got %d", got)
+	}
+}
+
+func TestLoadProviderContextWindowOptional(t *testing.T) {
+	path := writeTempFile(t, validProviderConfig())
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cfg.Providers[0].ContextWindow; got != 0 {
+		t.Fatalf("expected unset context window to be 0, got %d", got)
+	}
+}
+
+func TestLoadProviderContextWindowInvalid(t *testing.T) {
+	path := writeTempFile(t, `
+providers:
+  - name: Claude
+    protocol: anthropic
+    api_key: test-key
+    model: claude-3-sonnet
+    context_window: -1
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid context_window error")
+	}
+	if !strings.Contains(err.Error(), "context_window") {
+		t.Fatalf("expected context_window in error, got %v", err)
+	}
+}
+
 func TestLoadMCPConfigValidation(t *testing.T) {
 	tests := []struct {
 		name    string

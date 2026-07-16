@@ -64,7 +64,7 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 
 		// 构建请求参数
 		params := openai.ChatCompletionNewParams{
-			Model:    p.cfg.Model,
+			Model:    requestModelName(p.cfg.Model),
 			Messages: messages,
 			StreamOptions: openai.ChatCompletionStreamOptionsParam{
 				IncludeUsage: param.Opt[bool]{Value: true},

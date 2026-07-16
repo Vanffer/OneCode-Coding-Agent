@@ -5,13 +5,24 @@ import "onecode/internal/llm"
 // Conversation 管理单会话的多轮对话历史
 type Conversation struct {
 	messages []llm.Message
+	context  *ContextState
 }
 
 // New 创建一个新的会话
-func New() *Conversation {
-	return &Conversation{
+func New(opts ...Option) *Conversation {
+	c := &Conversation{
 		messages: make([]llm.Message, 0),
 	}
+	c.context = newContextState(ContextOptions{})
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	if c.context == nil {
+		c.context = newContextState(ContextOptions{})
+	}
+	return c
 }
 
 // AddUser 添加一条用户消息
@@ -58,7 +69,19 @@ func (c *Conversation) MessageCount() int {
 	return len(c.messages)
 }
 
+// ContextState 返回当前上下文管理状态的快照。
+func (c *Conversation) ContextState() ContextState {
+	if c.context == nil {
+		c.context = newContextState(ContextOptions{})
+	}
+	return *c.context
+}
+
 // Clear 清空对话历史
 func (c *Conversation) Clear() {
 	c.messages = make([]llm.Message, 0)
+	if c.context != nil {
+		c.context.Usage = UsageEstimate{}
+		c.context.Fuse = CompactFuse{}
+	}
 }

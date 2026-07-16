@@ -39,6 +39,7 @@ providers:
     model: claude-3-sonnet-20240229
     base_url: ""  # 留空使用官方 API
     thinking: false
+    context_window: 200000  # 可选，不填时使用默认 256K
 
   # OpenAI 官方 API
   - name: GPT-4
@@ -67,9 +68,10 @@ providers:
 - `name`: Provider 名称，显示在状态栏左侧
 - `protocol`: API 协议，支持 `anthropic` 或 `openai`
 - `api_key`: API 密钥
-- `model`: 模型名称，显示在状态栏右侧
+- `model`: 模型名称，显示在状态栏右侧；可在末尾追加窗口标记，例如 `deepseek-chat[1M]`
 - `base_url`: 自定义 API 端点（可选，留空使用官方 API，设置后可连接第三方供应商）
 - `thinking`: 是否启用 Claude 的 extended thinking（仅 anthropic 生效）
+- `context_window`: 上下文窗口 token 上限（可选，不填时使用默认 256K；优先级高于模型名窗口标记）
 
 ### 支持的第三方供应商
 
@@ -88,12 +90,36 @@ providers:
 5. 查看流式回复
 6. 输入 `/exit` 或按 `Ctrl+C` 退出
 
+### 上下文管理
+
+OneCode 会在状态栏展示当前上下文窗口使用情况，并在工具结果过大时把完整结果保存到当前项目的 `.onecode/context/tool-results/`，对话里只保留预览和可重新读取的路径。
+
+- `/compact`: 手动触发上下文压缩
+- `/context`: 查看当前上下文窗口来源、使用量和状态
+- `/context window 200000`: 为当前项目保存本地上下文窗口大小
+- `/context window`: 进入上下文窗口大小输入模式
+
+默认上下文窗口是 256K。需要使用更大窗口时，可以通过 `/context window 1000000` 在 TUI 中为当前项目保存，也可以把模型名写成 `model-name[1M]`、`model-name[512K]` 这类后缀形式。
+
+上下文管理运行产物位于：
+
+```text
+.onecode/context/
+├── .gitignore
+├── local.yaml
+└── tool-results/
+```
+
+OneCode 会自动维护 `.onecode/context/.gitignore`，只忽略 `local.yaml` 和 `tool-results/`，不会修改项目根目录的 `.gitignore`。
+
 ## 快捷键
 
 - `Enter`: 发送消息
 - `Alt+Enter`: 换行
 - `Ctrl+C`: 退出
 - `/exit`: 退出
+- `/compact`: 手动压缩上下文
+- `/context`: 查看上下文窗口状态
 
 ## 技术栈
 

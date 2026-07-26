@@ -381,6 +381,61 @@ providers:
 	}
 }
 
+func TestMemoryEnabledDefaultsToTrue(t *testing.T) {
+	cfg, err := Load(writeTempFile(t, validProviderConfig()))
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if !cfg.Memory.Enabled {
+		t.Fatal("expected memory to be enabled by default")
+	}
+}
+
+func TestLoadMemoryDisabled(t *testing.T) {
+	cfg, err := Load(writeTempFile(t, validProviderConfig()+`
+memory:
+  enabled: false
+`))
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Memory.Enabled {
+		t.Fatal("expected memory to be disabled")
+	}
+}
+
+func TestLoadMergedMemoryPrecedence(t *testing.T) {
+	tests := []struct {
+		name       string
+		userMemory string
+		project    string
+		want       bool
+	}{
+		{name: "default", want: true},
+		{name: "user disables", userMemory: "memory:\n  enabled: false\n", want: false},
+		{name: "project overrides user", userMemory: "memory:\n  enabled: false\n", project: "memory:\n  enabled: true\n", want: true},
+		{name: "project disables", userMemory: "memory:\n  enabled: true\n", project: "memory:\n  enabled: false\n", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			userPath := filepath.Join(dir, "user.yaml")
+			projectPath := filepath.Join(dir, "project.yaml")
+			writeFile(t, userPath, tt.userMemory)
+			writeFile(t, projectPath, validProviderConfig()+tt.project)
+
+			cfg, err := LoadMerged(userPath, projectPath)
+			if err != nil {
+				t.Fatalf("LoadMerged returned error: %v", err)
+			}
+			if cfg.Memory.Enabled != tt.want {
+				t.Fatalf("expected memory enabled=%t, got %t", tt.want, cfg.Memory.Enabled)
+			}
+		})
+	}
+}
+
 func TestExpandMCPEnvAndHeaders(t *testing.T) {
 	t.Setenv("ONECODE_MCP_TOKEN", "secret-token")
 	t.Setenv("ONECODE_MCP_PATH", "C:/mcp")

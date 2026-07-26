@@ -63,11 +63,51 @@ func TestBuildPayloadKeepsDynamicContextOutOfStableSystem(t *testing.T) {
 		CWD:       "dynamic-workspace",
 		OS:        "windows",
 		Now:       time.Date(2026, 6, 30, 8, 0, 0, 0, time.UTC),
+		Session: SessionPromptContext{
+			Instructions: "dynamic-project-rule",
+			MemoryIndex:  "dynamic-memory-index",
+			ResumeGap:    "dynamic-resume-gap",
+		},
 	})
 
-	for _, forbidden := range []string{"dynamic-workspace", "2026-06-30", "Iteration: 1", "Git status"} {
+	for _, forbidden := range []string{
+		"dynamic-workspace", "2026-06-30", "Iteration: 1", "Git status",
+		"dynamic-project-rule", "dynamic-memory-index", "dynamic-resume-gap",
+	} {
 		if strings.Contains(payload.StableSystem, forbidden) {
 			t.Fatalf("stable prompt should not contain %q:\n%s", forbidden, payload.StableSystem)
+		}
+	}
+}
+
+func TestBuildPayloadSessionReminderOrder(t *testing.T) {
+	runtime, err := NewRuntime(BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := runtime.BuildPayload(RequestContext{
+		Mode:      "plan",
+		Iteration: 1,
+		Now:       time.Date(2026, 7, 17, 10, 0, 0, 0, time.UTC),
+		Session: SessionPromptContext{
+			Instructions: "project rules",
+			MemoryIndex:  "known facts",
+			ResumeGap:    "resumed after 48 hours",
+		},
+	})
+	want := []ReminderKind{
+		ReminderEnvironment,
+		ReminderInstructions,
+		ReminderMemoryIndex,
+		ReminderResumeGap,
+		ReminderPlanMode,
+	}
+	if len(payload.Reminders) != len(want) {
+		t.Fatalf("expected %d reminders, got %+v", len(want), payload.Reminders)
+	}
+	for i, kind := range want {
+		if payload.Reminders[i].Kind != kind {
+			t.Fatalf("reminder %d: expected %s, got %s", i, kind, payload.Reminders[i].Kind)
 		}
 	}
 }

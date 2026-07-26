@@ -2,7 +2,9 @@ package agent
 
 import (
 	"onecode/internal/conversation"
+	"onecode/internal/llm"
 	"onecode/internal/permission"
+	"onecode/internal/prompt"
 )
 
 // Mode 表示 Agent 本次运行处于哪种工具开放策略。
@@ -19,6 +21,7 @@ type RunOptions struct {
 	MaxIterations          int
 	MaxConsecutiveBadTools int
 	ReminderInterval       int
+	PromptContext          prompt.SessionPromptContext
 }
 
 // String returns the prompt-runtime mode name.
@@ -43,19 +46,36 @@ const (
 	EventCancelled
 	EventPermissionRequest
 	EventContext
+	EventConversation
 )
 
 // Event 是 Agent 和 TUI 之间唯一的异步通信载体。
 type Event struct {
-	Type       EventType
-	Text       string
-	Tool       *ToolEvent
-	Usage      *UsageEvent
-	Progress   *ProgressEvent
-	Done       *DoneEvent
-	Permission *PermissionEvent
-	Context    *ContextEvent
-	Err        error
+	Type         EventType
+	Text         string
+	Tool         *ToolEvent
+	Usage        *UsageEvent
+	Progress     *ProgressEvent
+	Done         *DoneEvent
+	Permission   *PermissionEvent
+	Context      *ContextEvent
+	Conversation *ConversationEvent
+	Err          error
+}
+
+// ConversationEventKind identifies an append or full effective-history replacement.
+type ConversationEventKind int
+
+const (
+	ConversationAppend ConversationEventKind = iota
+	ConversationSnapshot
+)
+
+// ConversationEvent reports an already-committed Conversation change.
+type ConversationEvent struct {
+	Kind     ConversationEventKind
+	Message  *llm.Message
+	Messages []llm.Message
 }
 
 // ToolEvent 描述一次工具调用开始或结束时的 UI 摘要。

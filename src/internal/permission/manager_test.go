@@ -107,6 +107,24 @@ func TestResolveConfirmation(t *testing.T) {
 	}
 }
 
+func TestConfirmationPreservesToolBatchPosition(t *testing.T) {
+	manager := newTestManager(t, testProjectRoot(t), ManagerOptions{Mode: ModeDefault})
+	decision := manager.Authorize(context.Background(), Request{
+		ID:         "call_2",
+		Tool:       "bash",
+		Args:       map[string]interface{}{"command": "git status"},
+		Safety:     tools.SafetySideEffect,
+		BatchIndex: 2,
+		BatchTotal: 3,
+	})
+	if decision.Action != ActionAsk || decision.Confirm == nil {
+		t.Fatalf("expected confirmation request, got %+v", decision)
+	}
+	if decision.Confirm.BatchIndex != 2 || decision.Confirm.BatchTotal != 3 {
+		t.Fatalf("unexpected batch position: %+v", decision.Confirm)
+	}
+}
+
 func TestConfirmationRules(t *testing.T) {
 	root := testProjectRoot(t)
 	store := &memoryStore{}

@@ -118,6 +118,9 @@ func (a *Agent) Compact(ctx context.Context, conv *conversation.Conversation, mo
 			sendEvent(ctx, events, Event{Type: EventDone, Done: &DoneEvent{Reason: StopStreamError}})
 			return
 		}
+		if !sendConversationSnapshot(ctx, events, conv.Messages()) {
+			return
+		}
 		sendEvent(ctx, events, Event{Type: EventDone, Done: &DoneEvent{Reason: StopModelDone}})
 	}()
 	return events

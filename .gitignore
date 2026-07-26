@@ -1,6 +1,10 @@
 # 配置文件（含 API 密钥）
 .onecode/config.yaml
 
+# 自动生成的本地会话和长期记忆
+.onecode/sessions/
+.onecode/memory/
+
 # Go 编译产物
 *.exe
 *.exe~

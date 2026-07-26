@@ -69,12 +69,67 @@ func (c *Conversation) MessageCount() int {
 	return len(c.messages)
 }
 
+// Restore replaces the current history with a defensive copy loaded from a
+// session. Project context configuration is preserved while runtime usage,
+// compaction failures, and the previous session's file index are reset.
+func (c *Conversation) Restore(messages []llm.Message) {
+	c.messages = cloneConversationMessages(messages)
+	if c.context != nil {
+		c.context.Usage = UsageEstimate{}
+		c.context.Fuse = CompactFuse{}
+		c.context.Files = &FileIndex{}
+	}
+}
+
 // ContextState 返回当前上下文管理状态的快照。
 func (c *Conversation) ContextState() ContextState {
 	if c.context == nil {
 		c.context = newContextState(ContextOptions{})
 	}
 	return *c.context
+}
+
+func cloneConversationMessages(messages []llm.Message) []llm.Message {
+	cloned := make([]llm.Message, len(messages))
+	for i, message := range messages {
+		cloned[i] = message
+		cloned[i].ToolCalls = make([]llm.ToolCall, len(message.ToolCalls))
+		for j, call := range message.ToolCalls {
+			cloned[i].ToolCalls[j] = call
+			cloned[i].ToolCalls[j].Input = cloneConversationMap(call.Input)
+		}
+		if message.ToolResult != nil {
+			result := *message.ToolResult
+			cloned[i].ToolResult = &result
+		}
+	}
+	return cloned
+}
+
+func cloneConversationMap(value map[string]interface{}) map[string]interface{} {
+	if value == nil {
+		return nil
+	}
+	cloned := make(map[string]interface{}, len(value))
+	for key, item := range value {
+		cloned[key] = cloneConversationValue(item)
+	}
+	return cloned
+}
+
+func cloneConversationValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		return cloneConversationMap(typed)
+	case []interface{}:
+		cloned := make([]interface{}, len(typed))
+		for i, item := range typed {
+			cloned[i] = cloneConversationValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 // Clear 清空对话历史

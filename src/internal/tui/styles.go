@@ -6,22 +6,15 @@ var (
 	// 状态栏样式
 	statusBarLeftStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("62")).
-				Foreground(lipgloss.Color("230")).
-				Padding(0, 1)
+				Foreground(lipgloss.Color("230"))
 
 	statusBarMiddleStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("235")).
-				Foreground(lipgloss.Color("252")).
-				Padding(0, 1)
+				Foreground(lipgloss.Color("252"))
 
 	statusBarRightStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("62")).
-				Foreground(lipgloss.Color("230")).
-				Padding(0, 1)
-
-	// spinner 样式
-	spinnerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("205"))
+				Foreground(lipgloss.Color("230"))
 
 	// 错误样式
 	errorStyle = lipgloss.NewStyle().

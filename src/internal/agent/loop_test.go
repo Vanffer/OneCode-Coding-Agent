@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -129,6 +130,69 @@ func TestLoopRunsMultipleToolRounds(t *testing.T) {
 	}
 }
 
+func TestLoopEmitsCommittedConversationAppendEvents(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{
+			{ToolCall: &llm.ToolCall{ID: "read", Name: "read_file", Input: map[string]interface{}{"path": "a.go"}}},
+			{Done: true, FinishReason: llm.FinishToolCalls},
+		}},
+		{events: []llm.StreamEvent{{Text: "done"}, {Done: true, FinishReason: llm.FinishStop}}},
+	}}
+	registry := tools.NewRegistry()
+	registry.RegisterWithSafety(&fakeTool{name: "read_file", result: "file"}, tools.SafetyReadOnly)
+	conv := conversation.New()
+	conv.AddUser("read")
+
+	events := drainEvents(New(provider, registry).Run(context.Background(), conv, RunOptions{Mode: ModeExecute}))
+	var changes []*ConversationEvent
+	for i := range events {
+		if events[i].Type == EventConversation && events[i].Conversation != nil {
+			changes = append(changes, events[i].Conversation)
+		}
+	}
+	if len(changes) != 3 {
+		t.Fatalf("expected assistant tool call, tool result, and final assistant events; got %+v", changes)
+	}
+	if changes[0].Kind != ConversationAppend || changes[0].Message == nil || len(changes[0].Message.ToolCalls) != 1 {
+		t.Fatalf("unexpected first conversation event: %+v", changes[0])
+	}
+	if changes[1].Message == nil || changes[1].Message.Role != "tool" || changes[1].Message.ToolResult.ToolUseID != "read" {
+		t.Fatalf("unexpected tool result event: %+v", changes[1])
+	}
+	if changes[2].Message == nil || changes[2].Message.Content != "done" {
+		t.Fatalf("unexpected final assistant event: %+v", changes[2])
+	}
+}
+
+func TestManualCompactEmitsConversationSnapshotBeforeDone(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{{events: []llm.StreamEvent{
+		{Text: "<formal_summary>## Task Goal\nContinue the implementation.</formal_summary>"},
+		{Done: true, FinishReason: llm.FinishStop},
+	}}}}
+	agent := New(provider, tools.NewRegistry())
+	conv := conversation.New()
+	conv.AddUser("implement the feature")
+	conv.AddAssistant("working on it")
+
+	events := drainEvents(agent.Compact(context.Background(), conv, conversation.CompactModeManual))
+	snapshotIndex := -1
+	doneIndex := -1
+	for i, event := range events {
+		if event.Type == EventConversation && event.Conversation != nil && event.Conversation.Kind == ConversationSnapshot {
+			snapshotIndex = i
+			if len(event.Conversation.Messages) != len(conv.Messages()) {
+				t.Fatalf("snapshot does not contain effective compacted history: %+v", event.Conversation.Messages)
+			}
+		}
+		if event.Type == EventDone {
+			doneIndex = i
+		}
+	}
+	if snapshotIndex < 0 || doneIndex < 0 || snapshotIndex >= doneIndex {
+		t.Fatalf("expected snapshot before done, snapshot=%d done=%d events=%+v", snapshotIndex, doneIndex, events)
+	}
+}
+
 func TestLoopStopsAtMaxIterations(t *testing.T) {
 	provider := &scriptedProvider{scripts: []streamScript{
 		{events: []llm.StreamEvent{
@@ -247,6 +311,39 @@ func TestLoopEmitsPermissionRequestAndContinuesAfterAllow(t *testing.T) {
 	}
 }
 
+func TestLoopPermissionRequestsIncludeToolBatchPosition(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{
+		{events: []llm.StreamEvent{
+			{ToolCall: &llm.ToolCall{ID: "bash_1", Name: "bash", Input: map[string]interface{}{"command": "git status"}}},
+			{ToolCall: &llm.ToolCall{ID: "bash_2", Name: "bash", Input: map[string]interface{}{"command": "git diff --stat"}}},
+			{Done: true, FinishReason: llm.FinishToolCalls},
+		}},
+		{events: []llm.StreamEvent{{Text: "done"}, {Done: true, FinishReason: llm.FinishStop}}},
+	}}
+	registry := tools.NewRegistry()
+	registry.RegisterWithSafety(&fakeTool{name: "bash", result: "ok"}, tools.SafetySideEffect)
+	manager, err := permission.NewManager(permission.ManagerOptions{Mode: permission.ModeDefault, ProjectRoot: "."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := New(provider, registry, WithPermissionManager(manager))
+
+	var positions [][2]int
+	for event := range agent.Run(context.Background(), conversation.New(), RunOptions{Mode: ModeExecute}) {
+		if event.Type != EventPermissionRequest || event.Permission == nil {
+			continue
+		}
+		request := event.Permission.Request
+		positions = append(positions, [2]int{request.BatchIndex, request.BatchTotal})
+		agent.RespondPermission(permission.ConfirmationResponse{RequestID: request.ID, Choice: permission.ChoiceAllowOnce})
+	}
+
+	want := [][2]int{{1, 2}, {2, 2}}
+	if !reflect.DeepEqual(positions, want) {
+		t.Fatalf("unexpected permission positions: got %v want %v", positions, want)
+	}
+}
+
 func TestAgentPassesPromptPayload(t *testing.T) {
 	provider := &scriptedProvider{scripts: []streamScript{
 		{events: []llm.StreamEvent{
@@ -267,6 +364,28 @@ func TestAgentPassesPromptPayload(t *testing.T) {
 	}
 	if call.prompt.Reminders[0].Kind != prompt.ReminderEnvironment {
 		t.Fatalf("expected environment reminder, got %q", call.prompt.Reminders[0].Kind)
+	}
+}
+
+func TestAgentPassesSessionPromptContext(t *testing.T) {
+	provider := &scriptedProvider{scripts: []streamScript{{events: []llm.StreamEvent{
+		{Text: "done"},
+		{Done: true, FinishReason: llm.FinishStop},
+	}}}}
+	agent := New(provider, tools.NewRegistry())
+	drainEvents(agent.Run(context.Background(), conversation.New(), RunOptions{
+		Mode: ModeExecute,
+		PromptContext: prompt.SessionPromptContext{
+			Instructions: "project instructions",
+			MemoryIndex:  "memory index",
+			ResumeGap:    "resumed after 48 hours",
+		},
+	}))
+	payload := provider.callAt(0).prompt
+	for _, kind := range []prompt.ReminderKind{prompt.ReminderInstructions, prompt.ReminderMemoryIndex, prompt.ReminderResumeGap} {
+		if !hasReminderKind(payload, kind) {
+			t.Fatalf("expected reminder %s, got %+v", kind, payload.Reminders)
+		}
 	}
 }
 
@@ -398,6 +517,9 @@ func TestLoopPostToolResultsAutoCompactsBeforeNextIteration(t *testing.T) {
 	if !hasContextEvent(events, ContextCompactCompleted) {
 		t.Fatalf("expected post-tool compact completed event, got %+v", events)
 	}
+	if !hasConversationChange(events, ConversationSnapshot) {
+		t.Fatalf("expected snapshot after post-tool compaction, got %+v", events)
+	}
 	if len(conv.Messages()) != 1 || !containsSystemSummaryBoundary(conv.Messages()[0].Content) {
 		t.Fatalf("expected conversation to be compacted before next iteration, got %+v", conv.Messages())
 	}
@@ -432,6 +554,9 @@ func TestLoopEmergencyCompactAndRetry(t *testing.T) {
 	}
 	if !hasContextEvent(events, ContextEmergencyRetry) {
 		t.Fatalf("expected emergency retry context event, got %+v", events)
+	}
+	if !hasConversationChange(events, ConversationSnapshot) {
+		t.Fatalf("expected snapshot after emergency compaction, got %+v", events)
 	}
 	if len(conv.Messages()) != 2 || !containsSystemSummaryBoundary(conv.Messages()[0].Content) || conv.Messages()[1].Content != "done" {
 		t.Fatalf("expected compacted context plus final assistant, got %+v", conv.Messages())
@@ -501,6 +626,15 @@ func containsSystemReminder(content string) bool {
 func hasContextEvent(events []Event, kind ContextEventKind) bool {
 	for _, event := range events {
 		if event.Type == EventContext && event.Context != nil && event.Context.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func hasConversationChange(events []Event, kind ConversationEventKind) bool {
+	for _, event := range events {
+		if event.Type == EventConversation && event.Conversation != nil && event.Conversation.Kind == kind {
 			return true
 		}
 	}

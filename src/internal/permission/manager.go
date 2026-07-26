@@ -203,6 +203,8 @@ func askDecision(req Request, target Target, reason string) Decision {
 			Target:      target.Value,
 			Risk:        riskForRequest(req),
 			Reason:      reason,
+			BatchIndex:  req.BatchIndex,
+			BatchTotal:  req.BatchTotal,
 		},
 	}
 }

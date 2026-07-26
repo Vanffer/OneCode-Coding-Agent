@@ -10,14 +10,29 @@ import (
 type ReminderKind string
 
 const (
-	ReminderEnvironment ReminderKind = "environment"
-	ReminderPlanMode    ReminderKind = "plan_mode"
+	ReminderEnvironment  ReminderKind = "environment"
+	ReminderInstructions ReminderKind = "instructions"
+	ReminderMemoryIndex  ReminderKind = "memory_index"
+	ReminderResumeGap    ReminderKind = "resume_gap"
+	ReminderPlanMode     ReminderKind = "plan_mode"
 )
 
 // Reminder is dynamic system-level prompt content for a single model request.
 type Reminder struct {
 	Kind    ReminderKind
 	Content string
+}
+
+func buildContentReminder(kind ReminderKind, label, content string) (Reminder, bool) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return Reminder{}, false
+	}
+	return Reminder{
+		Kind: kind,
+		Content: fmt.Sprintf("<system-reminder>\n%s:\n%s\n</system-reminder>",
+			label, content),
+	}, true
 }
 
 // ShouldInjectFullPlanReminder reports whether this iteration needs the full

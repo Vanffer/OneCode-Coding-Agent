@@ -24,6 +24,32 @@ type ProviderConfig struct {
 type Config struct {
 	Providers  []ProviderConfig     `yaml:"providers"`
 	MCPServers map[string]MCPConfig `yaml:"mcp_servers"`
+	Memory     MemoryConfig         `yaml:"memory"`
+}
+
+// MemoryConfig controls persistent automatic memory.
+// configured is used only while merging user and project configuration.
+type MemoryConfig struct {
+	Enabled    bool `yaml:"enabled"`
+	configured bool
+}
+
+// UnmarshalYAML preserves whether enabled was explicitly configured while
+// keeping the runtime value as a plain bool.
+func (m *MemoryConfig) UnmarshalYAML(value *yaml.Node) error {
+	var raw struct {
+		Enabled *bool `yaml:"enabled"`
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	m.Enabled = true
+	m.configured = false
+	if raw.Enabled != nil {
+		m.Enabled = *raw.Enabled
+		m.configured = true
+	}
+	return nil
 }
 
 // MCPConfig 定义一个 MCP Server 的配置。
@@ -68,6 +94,7 @@ func LoadMerged(userPath, projectPath string) (*Config, error) {
 	merged := Config{
 		Providers:  projectCfg.Providers,
 		MCPServers: map[string]MCPConfig{},
+		Memory:     MemoryConfig{Enabled: true},
 	}
 
 	if userPath != "" {
@@ -80,10 +107,16 @@ func LoadMerged(userPath, projectPath string) (*Config, error) {
 			if err := validate(&userCfg, false); err != nil {
 				return nil, err
 			}
+			if userCfg.Memory.configured {
+				merged.Memory = userCfg.Memory
+			}
 			for name, server := range userCfg.MCPServers {
 				merged.MCPServers[name] = server
 			}
 		}
+	}
+	if projectCfg.Memory.configured {
+		merged.Memory = projectCfg.Memory
 	}
 
 	for name, server := range projectCfg.MCPServers {
@@ -99,7 +132,7 @@ func loadFile(path string) (Config, error) {
 		return Config{}, fmt.Errorf("无法读取配置文件 %s: %w", path, err)
 	}
 
-	var cfg Config
+	cfg := Config{Memory: MemoryConfig{Enabled: true}}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("配置文件格式错误: %w", err)
 	}

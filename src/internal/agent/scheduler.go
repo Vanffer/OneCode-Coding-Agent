@@ -48,13 +48,13 @@ func (a *Agent) executeToolCalls(
 				}
 				end++
 			}
-			a.executeReadOnlyBatch(ctx, calls[i:end], results[i:end], mode, events)
+			a.executeReadOnlyBatch(ctx, calls[i:end], results[i:end], mode, events, i, len(calls))
 			i = end
 			continue
 		}
 
 		category, _ := a.registry.Category(call.Name)
-		results[i] = a.executeOneTool(ctx, call, safety, category, mode, events)
+		results[i] = a.executeOneTool(ctx, call, safety, category, mode, events, i+1, len(calls))
 		i++
 	}
 
@@ -77,6 +77,8 @@ func (a *Agent) executeReadOnlyBatch(
 	results []llm.ToolResult,
 	mode Mode,
 	events chan<- Event,
+	batchStart int,
+	batchTotal int,
 ) {
 	var wg sync.WaitGroup
 	for i := range calls {
@@ -84,13 +86,13 @@ func (a *Agent) executeReadOnlyBatch(
 		go func(i int) {
 			defer wg.Done()
 			category, _ := a.registry.Category(calls[i].Name)
-			results[i] = a.executeOneTool(ctx, calls[i], tools.SafetyReadOnly, category, mode, events)
+			results[i] = a.executeOneTool(ctx, calls[i], tools.SafetyReadOnly, category, mode, events, batchStart+i+1, batchTotal)
 		}(i)
 	}
 	wg.Wait()
 }
 
-func (a *Agent) executeOneTool(ctx context.Context, call llm.ToolCall, safety tools.Safety, category tools.ToolCategory, mode Mode, events chan<- Event) llm.ToolResult {
+func (a *Agent) executeOneTool(ctx context.Context, call llm.ToolCall, safety tools.Safety, category tools.ToolCategory, mode Mode, events chan<- Event, batchIndex, batchTotal int) llm.ToolResult {
 	argsPreview := formatArgsPreview(call.Input)
 	sendEvent(ctx, events, Event{
 		Type: EventToolStart,
@@ -103,11 +105,13 @@ func (a *Agent) executeOneTool(ctx context.Context, call llm.ToolCall, safety to
 
 	if a.permissionManager != nil {
 		decision := a.permissionManager.Resolve(ctx, permission.Request{
-			ID:       call.ID,
-			Tool:     call.Name,
-			Args:     call.Input,
-			Safety:   safety,
-			Category: category,
+			ID:         call.ID,
+			Tool:       call.Name,
+			Args:       call.Input,
+			Safety:     safety,
+			Category:   category,
+			BatchIndex: batchIndex,
+			BatchTotal: batchTotal,
 		})
 		if decision.Action != permission.ActionAllow {
 			message := fmt.Sprintf("权限拒绝: %s", decision.Reason)

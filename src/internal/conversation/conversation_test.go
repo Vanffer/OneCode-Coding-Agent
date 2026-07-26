@@ -190,3 +190,33 @@ func TestConversationClearResetsContextRuntimeState(t *testing.T) {
 		t.Fatalf("expected runtime context state to be reset, got usage=%+v fuse=%+v", state.Usage, state.Fuse)
 	}
 }
+
+func TestConversationRestoreCopiesMessagesAndResetsRuntimeState(t *testing.T) {
+	conv := New(WithContextOptions(ContextOptions{ProjectRoot: "/tmp/project", ProviderWindow: 200000}))
+	conv.AddUser("old")
+	conv.context.Usage = UsageEstimate{Used: 50, Limit: 100}
+	conv.context.Fuse = CompactFuse{ConsecutiveFailures: 2, Tripped: true}
+	conv.context.Files.Entries = append(conv.context.Files.Entries, FileIndexEntry{Path: "old.go"})
+	messages := []llm.Message{
+		{Role: "user", Content: "restored"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call", Input: map[string]interface{}{"nested": map[string]interface{}{"value": "original"}}}}},
+		{Role: "tool", ToolResult: &llm.ToolResult{ToolUseID: "call", Content: "result"}},
+	}
+
+	conv.Restore(messages)
+	messages[0].Content = "mutated"
+	messages[1].ToolCalls[0].Input["nested"].(map[string]interface{})["value"] = "mutated"
+	messages[2].ToolResult.Content = "mutated"
+
+	got := conv.Messages()
+	if got[0].Content != "restored" || got[1].ToolCalls[0].Input["nested"].(map[string]interface{})["value"] != "original" || got[2].ToolResult.Content != "result" {
+		t.Fatalf("Restore did not defensively copy messages: %+v", got)
+	}
+	state := conv.ContextState()
+	if state.ProjectRoot != "/tmp/project" || state.Window.Limit != 200000 {
+		t.Fatalf("Restore changed context configuration: %+v", state)
+	}
+	if state.Usage.Used != 0 || state.Fuse.Tripped || len(state.Files.Entries) != 0 {
+		t.Fatalf("Restore did not reset runtime state: %+v", state)
+	}
+}

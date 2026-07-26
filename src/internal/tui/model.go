@@ -2,7 +2,9 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -11,13 +13,16 @@ import (
 	"onecode/internal/config"
 	"onecode/internal/conversation"
 	"onecode/internal/llm"
+	"onecode/internal/memory"
 	"onecode/internal/permission"
+	"onecode/internal/prompt"
 	"onecode/internal/tools"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // sessionState 表示 TUI 的会话状态
@@ -29,40 +34,54 @@ const (
 	stateStreaming                              // 等待/接收模型流（spinner+计时）
 	statePermissionConfirm                      // 等待用户确认工具权限
 	stateContextWindowInput                     // 输入上下文窗口大小
+	stateSessionLoading                         // 扫描或恢复历史会话
+	stateSessionPicker                          // 选择要恢复的历史会话
 )
 
 const mainInputPlaceholder = "Send a message..."
 
 // Model 是 TUI 的主模型
 type Model struct {
-	state           sessionState
-	textarea        textarea.Model
-	spinner         spinner.Model
-	selectIndex     int // provider 选择索引
-	renderer        *glamour.TermRenderer
-	providers       []config.ProviderConfig
-	provider        llm.Provider
-	agent           *agent.Agent
-	registry        *tools.Registry
-	projectRoot     string
-	conv            *conversation.Conversation
-	agentEvents     <-chan agent.Event // 当前 agent 事件
-	cancelCurrent   context.CancelFunc // 当前 agent run 的取消函数
-	pendingPerm     *agent.PermissionEvent
-	permSelectIndex int
-	pendingPlan     *PendingPlan // /plan 生成、/do 消费的待执行计划
-	currentMode     agent.Mode   // 当前运行模式
-	progressStatus  string       // Agent 进度状态栏文案
-	contextUsage    conversation.UsageEstimate
-	contextWindow   conversation.WindowInfo
-	contextStatus   string
-	curReply        *strings.Builder // 本轮 assistant 增量缓冲
-	pendingChars    int              // 待渲染字符数（用于批量更新）
-	pendingMarkdown string           // 待打印的 markdown
-	turnStart       time.Time        // 计时起点
-	width, height   int
-	ready           bool  // 界面是否已初始化
-	err             error // 错误信息
+	state              sessionState
+	textarea           textarea.Model
+	spinner            spinner.Model
+	selectIndex        int // provider 选择索引
+	renderer           *glamour.TermRenderer
+	providers          []config.ProviderConfig
+	provider           llm.Provider
+	agent              *agent.Agent
+	registry           *tools.Registry
+	projectRoot        string
+	conv               *conversation.Conversation
+	agentEvents        <-chan agent.Event // 当前 agent 事件
+	cancelCurrent      context.CancelFunc // 当前 agent run 的取消函数
+	pendingPerm        *agent.PermissionEvent
+	permissionFeedback string
+	permSelectIndex    int
+	pendingPlan        *PendingPlan // /plan 生成、/do 消费的待执行计划
+	currentMode        agent.Mode   // 当前运行模式
+	progressStatus     string       // Agent 进度状态栏文案
+	contextUsage       conversation.UsageEstimate
+	contextWindow      conversation.WindowInfo
+	contextStatus      string
+	instructionLoader  *memory.InstructionLoader
+	instructions       memory.InstructionSet
+	sessionStore       *memory.SessionStore
+	journal            *memory.SessionJournal
+	noteStore          *memory.NoteStore
+	memoryWorker       *memory.Worker
+	sessionID          string
+	pendingResumeGap   string
+	turnMessages       []llm.Message
+	resumeSessions     []memory.SessionInfo
+	resumeSelectIndex  int
+	now                func() time.Time
+	curReply           *strings.Builder // 本轮 assistant 增量缓冲
+	pendingMarkdown    string           // 待打印的 markdown
+	turnStart          time.Time        // 计时起点
+	width, height      int
+	ready              bool  // 界面是否已初始化
+	err                error // 错误信息
 }
 
 // PendingPlan 保存 /plan 生成的待执行计划，仅保留在当前进程内存中。
@@ -72,17 +91,40 @@ type PendingPlan struct {
 	Consumed  bool
 }
 
+// MemoryDependencies groups concrete persistent-memory services without
+// introducing another manager abstraction.
+type MemoryDependencies struct {
+	InstructionLoader *memory.InstructionLoader
+	Instructions      memory.InstructionSet
+	Sessions          *memory.SessionStore
+	Notes             *memory.NoteStore
+	Worker            *memory.Worker
+}
+
 // agentEventMsg 包装 agent.Event 用于 tea.Msg
 type agentEventMsg agent.Event
-
-// tickMsg 定时触发的消息，用于批量更新
-type tickMsg time.Time
 
 // doneMsg 流式完成后的延迟消息
 type doneMsg struct{}
 
+type memoryErrorMsg struct {
+	err    error
+	closed bool
+}
+
+type sessionListMsg struct {
+	sessions []memory.SessionInfo
+	err      error
+}
+
+type sessionRestoreMsg struct {
+	result  memory.RestoreResult
+	journal *memory.SessionJournal
+	err     error
+}
+
 // New 创建新的 TUI 模型
-func New(providers []config.ProviderConfig, registry *tools.Registry, projectRoot string) Model {
+func New(providers []config.ProviderConfig, registry *tools.Registry, projectRoot string, memoryDeps MemoryDependencies) Model {
 	// 创建 textarea
 	ta := textarea.New()
 	ta.Placeholder = mainInputPlaceholder
@@ -95,7 +137,6 @@ func New(providers []config.ProviderConfig, registry *tools.Registry, projectRoo
 	// 创建 spinner
 	s := spinner.New()
 	s.Spinner = spinner.Dot
-	s.Style = spinnerStyle
 
 	// 创建 glamour renderer
 	renderer, _ := glamour.NewTermRenderer(
@@ -126,22 +167,27 @@ func New(providers []config.ProviderConfig, registry *tools.Registry, projectRoo
 	contextState := conv.ContextState()
 
 	return Model{
-		state:         state,
-		textarea:      ta,
-		spinner:       s,
-		renderer:      renderer,
-		providers:     providers,
-		provider:      provider,
-		agent:         ag,
-		registry:      registry,
-		projectRoot:   projectRoot,
-		conv:          conv,
-		contextUsage:  contextState.Usage,
-		contextWindow: contextState.Window,
-		curReply:      &strings.Builder{},
-		width:         80,
-		height:        24,
-		err:           initErr,
+		state:             state,
+		textarea:          ta,
+		spinner:           s,
+		renderer:          renderer,
+		providers:         providers,
+		provider:          provider,
+		agent:             ag,
+		registry:          registry,
+		projectRoot:       projectRoot,
+		conv:              conv,
+		contextUsage:      contextState.Usage,
+		contextWindow:     contextState.Window,
+		instructionLoader: memoryDeps.InstructionLoader,
+		instructions:      memoryDeps.Instructions,
+		sessionStore:      memoryDeps.Sessions,
+		noteStore:         memoryDeps.Notes,
+		memoryWorker:      memoryDeps.Worker,
+		curReply:          &strings.Builder{},
+		width:             80,
+		height:            24,
+		err:               initErr,
 	}
 }
 
@@ -169,17 +215,11 @@ func newAgent(provider llm.Provider, registry *tools.Registry, projectRoot strin
 
 // Init 初始化模型
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
-		textarea.Blink,
-		m.spinner.Tick,
-	)
-}
-
-// renderTick 启动定时渲染（每 50ms 触发一次，用于批量更新）
-func renderTick() tea.Cmd {
-	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
+	cmds := []tea.Cmd{textarea.Blink}
+	if m.memoryWorker != nil {
+		cmds = append(cmds, waitForMemoryError(m.memoryWorker.Errors()))
+	}
+	return tea.Batch(cmds...)
 }
 
 // waitForAgentEvent 读取一个 agent 事件并返回 agentEventMsg
@@ -193,6 +233,13 @@ func waitForAgentEvent(ch <-chan agent.Event) tea.Cmd {
 			}
 		}
 		return agentEventMsg(event)
+	}
+}
+
+func waitForMemoryError(ch <-chan error) tea.Cmd {
+	return func() tea.Msg {
+		err, ok := <-ch
+		return memoryErrorMsg{err: err, closed: !ok}
 	}
 }
 
@@ -249,6 +296,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateIdle
 				return m, nil
 			}
+			return m, nil
+		}
+
+		if m.state == stateSessionPicker {
+			switch msg.String() {
+			case "up", "k":
+				m.moveSessionSelection(-1)
+				return m, nil
+			case "down", "j":
+				m.moveSessionSelection(1)
+				return m, nil
+			case "enter":
+				return m.startSelectedSessionRestore()
+			case "esc":
+				m.state = stateIdle
+				m.textarea.Focus()
+				return m, nil
+			}
+			return m, nil
+		}
+
+		if m.state == stateSessionLoading {
 			return m, nil
 		}
 
@@ -383,26 +452,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
-	case tickMsg:
-		// 定时渲染：运行状态下每 50ms 强制重绘一次
-		if m.state == stateStreaming && m.pendingChars > 0 {
-			m.pendingChars = 0
-		}
-		if isActiveRunState(m.state) {
-			cmds = append(cmds, renderTick())
-		}
-
 	case agentEventMsg:
 		// 处理 agent 事件
 		switch msg.Type {
 		case agent.EventPermissionRequest:
 			if msg.Permission != nil {
 				m.pendingPerm = msg.Permission
+				m.permissionFeedback = ""
 				m.permSelectIndex = 0
 				m.progressStatus = "Waiting for permission"
 				m.state = statePermissionConfirm
 			}
-			cmds = append(cmds, m.spinner.Tick, renderTick())
 			return m, tea.Batch(cmds...)
 
 		case agent.EventError:
@@ -414,6 +474,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingPlan = nil
 			}
 			m.cancelCurrent = nil
+			m.pendingPerm = nil
+			m.permissionFeedback = ""
+			m.turnMessages = nil
 			m.state = stateIdle
 			m.textarea.Focus()
 			return m, tea.Batch(cmds...)
@@ -421,7 +484,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case agent.EventText:
 			// 文本增量
 			m.curReply.WriteString(msg.Text)
-			m.pendingChars++
 			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
 
 		case agent.EventToolStart:
@@ -445,6 +507,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case agent.EventProgress:
 			if msg.Progress != nil {
 				m.progressStatus = msg.Progress.Message
+			}
+			if m.state == statePermissionConfirm && m.pendingPerm == nil {
+				m.permissionFeedback = ""
+				m.state = stateStreaming
 			}
 			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
 
@@ -475,6 +541,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
 
+		case agent.EventConversation:
+			if msg.Conversation != nil {
+				if err := m.persistConversationEvent(msg.Conversation); err != nil {
+					cmds = append(cmds, tea.Println(fmt.Sprintf("\nWarning: %s\n", err)))
+				}
+			}
+			cmds = append(cmds, waitForAgentEvent(m.agentEvents))
+
 		case agent.EventCancelled:
 			m.progressStatus = "Cancelled"
 			cmds = append(cmds, tea.Println("\n任务已取消"))
@@ -482,7 +556,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case agent.EventDone:
 			// 流式完成
-			m.pendingChars = 0
 			if m.currentMode == agent.ModePlan && msg.Done != nil && msg.Done.Reason == agent.StopModelDone && m.curReply.Len() > 0 {
 				m.pendingPlan = &PendingPlan{
 					Content:   m.curReply.String(),
@@ -492,7 +565,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.pendingPlan != nil && m.pendingPlan.Consumed {
 				m.pendingPlan = nil
 			}
+			if msg.Done != nil && msg.Done.Reason == agent.StopModelDone && len(m.turnMessages) > 0 && m.memoryWorker != nil && m.provider != nil {
+				m.memoryWorker.Enqueue(m.provider, memory.TurnCandidate{
+					SessionID: m.sessionID,
+					Messages:  append([]llm.Message(nil), m.turnMessages...),
+					StoppedAt: m.clock(),
+				})
+			}
+			m.turnMessages = nil
 			m.cancelCurrent = nil
+			m.pendingPerm = nil
+			m.permissionFeedback = ""
 			m.progressStatus = ""
 			if m.curReply.Len() > 0 {
 				rendered, err := m.renderer.Render(m.curReply.String())
@@ -507,6 +590,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return doneMsg{}
 			})
 		}
+
+	case memoryErrorMsg:
+		if msg.err != nil {
+			cmds = append(cmds, tea.Println(fmt.Sprintf("\nWarning: 自动记忆更新失败: %s\n", msg.err)))
+		}
+		if !msg.closed && m.memoryWorker != nil {
+			cmds = append(cmds, waitForMemoryError(m.memoryWorker.Errors()))
+		}
+
+	case sessionListMsg:
+		if msg.err != nil {
+			m.state = stateIdle
+			m.textarea.Focus()
+			return m, tea.Println(fmt.Sprintf("\n恢复会话列表失败: %s\n", msg.err))
+		}
+		if len(msg.sessions) == 0 {
+			m.state = stateIdle
+			m.textarea.Focus()
+			return m, tea.Println("\n没有可恢复的历史会话。")
+		}
+		m.resumeSessions = msg.sessions
+		m.resumeSelectIndex = 0
+		m.state = stateSessionPicker
+		return m, nil
+
+	case sessionRestoreMsg:
+		if msg.err != nil {
+			m.state = stateIdle
+			m.textarea.Focus()
+			return m, tea.Println(fmt.Sprintf("\n恢复会话失败: %s\n", msg.err))
+		}
+		return m.applyRestoredSession(msg)
 
 	case doneMsg:
 		// 打印延迟的 markdown
@@ -533,6 +648,14 @@ func (m Model) handleSlashCommand(input string) (Model, tea.Cmd, bool) {
 
 	case input == "/compact":
 		next, cmd := m.startCompactRun()
+		return next, cmd, true
+
+	case input == "/continue":
+		next, cmd := m.startContinueSession()
+		return next, cmd, true
+
+	case input == "/resume":
+		next, cmd := m.startSessionList()
 		return next, cmd, true
 
 	case input == "/context":
@@ -573,17 +696,54 @@ func (m Model) handleSlashCommand(input string) (Model, tea.Cmd, bool) {
 }
 
 func (m Model) startAgentRun(input string, mode agent.Mode, opts agent.RunOptions) (Model, tea.Cmd) {
+	var cmds []tea.Cmd
+	if m.journal == nil && m.sessionStore != nil {
+		journal, err := m.sessionStore.Create()
+		if err != nil {
+			cmds = append(cmds, tea.Println(fmt.Sprintf("\nWarning: 创建会话存档失败: %s\n", err)))
+		} else {
+			m.journal = journal
+			m.sessionID = journal.ID()
+		}
+	}
+	userMessage := llm.Message{Role: "user", Content: input}
 	m.conv.AddUser(input)
+	m.turnMessages = []llm.Message{userMessage}
+	if m.journal != nil {
+		if err := m.journal.AppendMessage(userMessage); err != nil {
+			cmds = append(cmds, tea.Println(fmt.Sprintf("\nWarning: 保存用户消息失败: %s\n", err)))
+			m.disableJournal()
+		}
+	}
+
+	memoryIndex := ""
+	if m.noteStore != nil {
+		loaded, err := m.noteStore.LoadIndexes()
+		if err != nil {
+			cmds = append(cmds, tea.Println(fmt.Sprintf("\nWarning: 读取长期记忆失败: %s\n", err)))
+		} else {
+			memoryIndex = loaded
+		}
+	}
+	opts.PromptContext = prompt.SessionPromptContext{
+		Instructions: m.instructions.Content,
+		MemoryIndex:  memoryIndex,
+		ResumeGap:    m.pendingResumeGap,
+	}
+	m.pendingResumeGap = ""
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelCurrent = cancel
 	m.currentMode = mode
+	m.pendingPerm = nil
+	m.permissionFeedback = ""
 	m.progressStatus = ""
 	m.agentEvents = m.agent.Run(ctx, m.conv, opts)
 	m.curReply.Reset()
 	m.turnStart = time.Now()
 	m.state = stateStreaming
 
-	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+	cmds = append(cmds, waitForAgentEvent(m.agentEvents), m.spinner.Tick)
+	return m, tea.Batch(cmds...)
 }
 
 func (m Model) startCompactRun() (Model, tea.Cmd) {
@@ -597,9 +757,10 @@ func (m Model) startCompactRun() (Model, tea.Cmd) {
 	m.progressStatus = "正在压缩上下文"
 	m.agentEvents = m.agent.Compact(ctx, m.conv, conversation.CompactModeManual)
 	m.curReply.Reset()
+	m.turnMessages = nil
 	m.turnStart = time.Now()
 	m.state = stateStreaming
-	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick)
 }
 
 func (m Model) applyContextWindowInput() (Model, tea.Cmd) {
@@ -639,14 +800,16 @@ func (m Model) cancelAgentRun() (Model, tea.Cmd) {
 
 func (m Model) answerPermission(choice permission.ConfirmationChoice) (Model, tea.Cmd) {
 	if m.agent != nil && m.pendingPerm != nil {
+		request := m.pendingPerm.Request
 		m.agent.RespondPermission(permission.ConfirmationResponse{
-			RequestID: m.pendingPerm.Request.ID,
+			RequestID: request.ID,
 			Choice:    choice,
 		})
+		m.permissionFeedback = permissionFeedback(choice, request)
 	}
 	m.pendingPerm = nil
-	m.state = stateStreaming
-	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+	m.state = statePermissionConfirm
+	return m, waitForAgentEvent(m.agentEvents)
 }
 
 func (m Model) cancelPermissionRun() (Model, tea.Cmd) {
@@ -657,12 +820,13 @@ func (m Model) cancelPermissionRun() (Model, tea.Cmd) {
 		})
 	}
 	m.pendingPerm = nil
+	m.permissionFeedback = ""
 	if m.cancelCurrent != nil {
 		m.cancelCurrent()
 		m.progressStatus = "Cancelling"
 	}
 	m.state = stateStreaming
-	return m, tea.Batch(waitForAgentEvent(m.agentEvents), m.spinner.Tick, renderTick())
+	return m, waitForAgentEvent(m.agentEvents)
 }
 
 func (m *Model) movePermissionSelection(delta int) {
@@ -706,6 +870,10 @@ func (m Model) View() tea.View {
 		return tea.NewView(m.viewPermissionConfirm())
 	case stateContextWindowInput:
 		return tea.NewView(m.viewContextWindowInput())
+	case stateSessionLoading:
+		return tea.NewView(m.viewSessionLoading())
+	case stateSessionPicker:
+		return tea.NewView(m.viewSessionPicker())
 	default:
 		return tea.NewView("")
 	}
@@ -772,7 +940,11 @@ func (m Model) viewPermissionConfirm() string {
 	var s strings.Builder
 
 	elapsed := time.Since(m.turnStart).Seconds()
-	status := fmt.Sprintf("%s Permission %.1fs", m.spinner.View(), elapsed)
+	statusText := "Permission"
+	if m.pendingPerm != nil && m.pendingPerm.Request.BatchTotal > 1 {
+		statusText = fmt.Sprintf("Permission %d/%d", m.pendingPerm.Request.BatchIndex, m.pendingPerm.Request.BatchTotal)
+	}
+	status := fmt.Sprintf("%s %s %.1fs", m.spinner.View(), statusText, elapsed)
 	s.WriteString(statusBar(m.provider, status, m.contextDisplay(), m.width))
 	s.WriteString("\n")
 
@@ -785,7 +957,11 @@ func (m Model) viewPermissionConfirm() string {
 	if m.pendingPerm != nil {
 		req := m.pendingPerm.Request
 		s.WriteString("\n")
-		s.WriteString(permissionTitleStyle.Render("Permission required"))
+		title := "Permission required"
+		if req.BatchTotal > 1 {
+			title = fmt.Sprintf("Permission required (tool call %d of %d)", req.BatchIndex, req.BatchTotal)
+		}
+		s.WriteString(permissionTitleStyle.Render(title))
 		s.WriteString("\n")
 		s.WriteString("-------------------\n")
 		s.WriteString(fmt.Sprintf("Tool: %s\n", req.Tool))
@@ -808,9 +984,32 @@ func (m Model) viewPermissionConfirm() string {
 		s.WriteString("\n")
 		s.WriteString(permissionHintStyle.Render("Use ↑/↓ to select, Enter to confirm. Shortcuts: o once, s session, f forever, d deny, esc cancel"))
 		s.WriteString("\n")
+	} else if m.permissionFeedback != "" {
+		s.WriteString("\n")
+		s.WriteString(permissionTitleStyle.Render("Permission recorded"))
+		s.WriteString("\n-------------------\n")
+		s.WriteString(m.permissionFeedback)
+		s.WriteString("\n")
 	}
 
 	return s.String()
+}
+
+func permissionFeedback(choice permission.ConfirmationChoice, request permission.ConfirmationRequest) string {
+	position := ""
+	if request.BatchTotal > 1 {
+		position = fmt.Sprintf("Tool call %d of %d: ", request.BatchIndex, request.BatchTotal)
+	}
+	switch choice {
+	case permission.ChoiceAllowOnce:
+		return fmt.Sprintf("%sAllowed once. Running %s...", position, request.Tool)
+	case permission.ChoiceAllowSession:
+		return fmt.Sprintf("%sAllowed for this session. Running %s...", position, request.Tool)
+	case permission.ChoiceAllowForever:
+		return fmt.Sprintf("%sAllowed permanently. Running %s...", position, request.Tool)
+	default:
+		return fmt.Sprintf("%sDenied. Checking remaining tool calls...", position)
+	}
 }
 
 func (m Model) viewContextWindowInput() string {
@@ -824,7 +1023,228 @@ func (m Model) viewContextWindowInput() string {
 }
 
 func isActiveRunState(state sessionState) bool {
-	return state == stateStreaming || state == statePermissionConfirm
+	return state == stateStreaming || state == statePermissionConfirm || state == stateSessionLoading
+}
+
+func (m *Model) persistConversationEvent(change *agent.ConversationEvent) error {
+	if change == nil {
+		return nil
+	}
+	switch change.Kind {
+	case agent.ConversationAppend:
+		if change.Message == nil {
+			return fmt.Errorf("Conversation append 事件缺少消息")
+		}
+		m.turnMessages = append(m.turnMessages, *change.Message)
+		if m.journal != nil {
+			if err := m.journal.AppendMessage(*change.Message); err != nil {
+				m.disableJournal()
+				return fmt.Errorf("保存会话消息失败: %w", err)
+			}
+		}
+	case agent.ConversationSnapshot:
+		if m.journal != nil {
+			if err := m.journal.AppendSnapshot(change.Messages); err != nil {
+				m.disableJournal()
+				return fmt.Errorf("保存会话快照失败: %w", err)
+			}
+		}
+	default:
+		return fmt.Errorf("未知 Conversation 事件: %d", change.Kind)
+	}
+	return nil
+}
+
+func (m *Model) disableJournal() {
+	if m.journal != nil {
+		_ = m.journal.Close()
+	}
+	m.journal = nil
+}
+
+func (m Model) startContinueSession() (Model, tea.Cmd) {
+	if m.sessionStore == nil {
+		return m, tea.Println("\n会话存档未配置。")
+	}
+	m.state = stateSessionLoading
+	m.progressStatus = "正在恢复最近会话"
+	m.turnStart = m.clock()
+	return m, tea.Batch(loadLatestSession(m.sessionStore), m.spinner.Tick)
+}
+
+func (m Model) startSessionList() (Model, tea.Cmd) {
+	if m.sessionStore == nil {
+		return m, tea.Println("\n会话存档未配置。")
+	}
+	m.state = stateSessionLoading
+	m.progressStatus = "正在扫描历史会话"
+	m.turnStart = m.clock()
+	return m, tea.Batch(listSessions(m.sessionStore), m.spinner.Tick)
+}
+
+func listSessions(store *memory.SessionStore) tea.Cmd {
+	return func() tea.Msg {
+		sessions, err := store.List()
+		return sessionListMsg{sessions: sessions, err: err}
+	}
+}
+
+func loadLatestSession(store *memory.SessionStore) tea.Cmd {
+	return func() tea.Msg {
+		result, err := store.Latest()
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				err = fmt.Errorf("没有可继续的最近会话")
+			}
+			return sessionRestoreMsg{err: err}
+		}
+		journal, err := store.Open(result.Info.ID)
+		return sessionRestoreMsg{result: result, journal: journal, err: err}
+	}
+}
+
+func loadSession(store *memory.SessionStore, id string) tea.Cmd {
+	return func() tea.Msg {
+		result, err := store.Load(id)
+		if err != nil {
+			return sessionRestoreMsg{err: err}
+		}
+		journal, err := store.Open(id)
+		return sessionRestoreMsg{result: result, journal: journal, err: err}
+	}
+}
+
+func (m Model) applyRestoredSession(msg sessionRestoreMsg) (tea.Model, tea.Cmd) {
+	if msg.journal == nil || len(msg.result.Messages) == 0 {
+		if msg.journal != nil {
+			_ = msg.journal.Close()
+		}
+		m.state = stateIdle
+		m.textarea.Focus()
+		return m, tea.Println("\n恢复会话失败: 会话没有有效消息。")
+	}
+	if m.journal != nil {
+		_ = m.journal.Close()
+	}
+	m.conv.Restore(msg.result.Messages)
+	m.journal = msg.journal
+	m.sessionID = msg.result.Info.ID
+	m.pendingPlan = nil
+	m.turnMessages = nil
+	m.resumeSessions = nil
+	m.resumeSelectIndex = 0
+	if m.instructionLoader != nil {
+		m.instructions = m.instructionLoader.Load()
+	}
+	state := m.conv.ContextState()
+	m.contextUsage = state.Usage
+	m.contextWindow = state.Window
+	m.contextStatus = "历史会话已恢复"
+	gap := m.clock().Sub(msg.result.LastActiveAt)
+	if gap > 24*time.Hour {
+		m.pendingResumeGap = fmt.Sprintf(
+			"This session was last active %s ago. Re-check repository state, git status, dependencies, and external facts before relying on old assumptions.",
+			formatDuration(gap),
+		)
+	} else {
+		m.pendingResumeGap = ""
+	}
+	m.state = stateIdle
+	m.progressStatus = ""
+	m.textarea.Focus()
+
+	var output strings.Builder
+	output.WriteString("\n已恢复会话 ")
+	output.WriteString(msg.result.Info.ID)
+	output.WriteString("\n")
+	for _, warning := range msg.result.Warnings {
+		output.WriteString("Warning: ")
+		if warning.Line > 0 {
+			output.WriteString(fmt.Sprintf("line %d: ", warning.Line))
+		}
+		output.WriteString(warning.Message)
+		output.WriteString("\n")
+	}
+	for _, warning := range m.instructions.Warnings {
+		output.WriteString("Warning: ")
+		output.WriteString(formatInstructionWarning(warning))
+		output.WriteString("\n")
+	}
+	output.WriteString(formatRecoveredTranscript(msg.result.Messages))
+	return m, tea.Println(output.String())
+}
+
+// Close releases the final session journal after Bubble Tea exits.
+func (m Model) Close() error {
+	if m.journal == nil {
+		return nil
+	}
+	return m.journal.Close()
+}
+
+func (m Model) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+func formatInstructionWarning(warning memory.LoadWarning) string {
+	location := warning.Path
+	if warning.Line > 0 {
+		location = fmt.Sprintf("%s:%d", location, warning.Line)
+	}
+	return fmt.Sprintf("%s: %s", location, warning.Message)
+}
+
+func formatRecoveredTranscript(messages []llm.Message) string {
+	var out strings.Builder
+	for _, message := range messages {
+		switch message.Role {
+		case "user":
+			out.WriteString("\n❯ ")
+			out.WriteString(truncateRunes(message.Content, 2000))
+			out.WriteString("\n")
+		case "assistant":
+			if strings.TrimSpace(message.Content) != "" {
+				out.WriteString("\n")
+				out.WriteString(truncateRunes(message.Content, 4000))
+				out.WriteString("\n")
+			}
+			for _, call := range message.ToolCalls {
+				out.WriteString(fmt.Sprintf("\n● %s(...)\n", call.Name))
+			}
+		case "tool":
+			if message.ToolResult != nil {
+				out.WriteString("  └─ ")
+				out.WriteString(truncateRunes(strings.ReplaceAll(message.ToolResult.Content, "\n", " "), 300))
+				out.WriteString("\n")
+			}
+		}
+	}
+	return out.String()
+}
+
+func truncateRunes(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	if max <= 3 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-3]) + "..."
+}
+
+func formatDuration(value time.Duration) string {
+	hours := int(value.Hours())
+	if hours < 48 {
+		return fmt.Sprintf("%d hours", hours)
+	}
+	return fmt.Sprintf("%d days", hours/24)
 }
 
 type permissionOption struct {
@@ -938,8 +1358,8 @@ func statusBar(provider llm.Provider, status string, contextText string, width i
 		contextPart = fmt.Sprintf(" %s ", contextText)
 	}
 
-	// 计算填充
-	padding := width - len(left) - len(right) - len(middle) - len(contextPart)
+	// ANSI 转义、中文和 ASCII 的字节数不同，必须按终端显示宽度计算。
+	padding := width - lipgloss.Width(left) - lipgloss.Width(right) - lipgloss.Width(middle) - lipgloss.Width(contextPart)
 	if padding < 0 {
 		padding = 0
 	}

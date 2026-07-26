@@ -31,6 +31,12 @@ func (a *Agent) runLoop(ctx context.Context, conv *conversation.Conversation, op
 			a.finish(ctx, events, StopStreamError, iteration)
 			return
 		}
+		if len(preflight.BoundedToolResults) > 0 || preflight.Compacted {
+			if !sendConversationSnapshot(ctx, events, conv.Messages()) {
+				a.finishCancelled(ctx, events, iteration-1)
+				return
+			}
+		}
 
 		sendEvent(ctx, events, Event{
 			Type: EventProgress,
@@ -69,6 +75,10 @@ func (a *Agent) runLoop(ctx context.Context, conv *conversation.Conversation, op
 		if len(response.ToolCalls) == 0 {
 			if response.Text != "" {
 				conv.AddAssistant(response.Text)
+				if !sendConversationAppend(ctx, events, llm.Message{Role: "assistant", Content: response.Text}) {
+					a.finishCancelled(ctx, events, iteration)
+					return
+				}
 			}
 			if !sendUsageAnchorStatus(ctx, events, conv, response.Usage) {
 				a.finishCancelled(ctx, events, iteration)
@@ -87,6 +97,10 @@ func (a *Agent) runLoop(ctx context.Context, conv *conversation.Conversation, op
 		}
 
 		conv.AddAssistantWithToolCalls(response.Text, response.ToolCalls)
+		if !sendConversationAppend(ctx, events, llm.Message{Role: "assistant", Content: response.Text, ToolCalls: response.ToolCalls}) {
+			a.finishCancelled(ctx, events, iteration)
+			return
+		}
 		if !sendUsageAnchorStatus(ctx, events, conv, response.Usage) {
 			a.finishCancelled(ctx, events, iteration)
 			return
@@ -103,6 +117,10 @@ func (a *Agent) runLoop(ctx context.Context, conv *conversation.Conversation, op
 		results, badToolCount := a.executeToolCalls(ctx, response.ToolCalls, opts.Mode, events)
 		for _, result := range results {
 			conv.AddToolResult(result)
+			if !sendConversationAppend(ctx, events, llm.Message{Role: "tool", ToolResult: &result}) {
+				a.finishCancelled(ctx, events, iteration)
+				return
+			}
 		}
 
 		if ctx.Err() != nil {
@@ -121,6 +139,12 @@ func (a *Agent) runLoop(ctx context.Context, conv *conversation.Conversation, op
 			sendEvent(ctx, events, Event{Type: EventError, Err: err})
 			a.finish(ctx, events, StopStreamError, iteration)
 			return
+		}
+		if len(postflight.BoundedToolResults) > 0 || postflight.Compacted {
+			if !sendConversationSnapshot(ctx, events, conv.Messages()) {
+				a.finishCancelled(ctx, events, iteration)
+				return
+			}
 		}
 
 		if badToolCount > 0 && badToolCount == len(response.ToolCalls) {
@@ -201,6 +225,75 @@ func sendEvent(ctx context.Context, events chan<- Event, event Event) bool {
 	}
 }
 
+func sendConversationAppend(ctx context.Context, events chan<- Event, message llm.Message) bool {
+	cloned := cloneAgentMessage(message)
+	return sendEvent(ctx, events, Event{
+		Type: EventConversation,
+		Conversation: &ConversationEvent{
+			Kind:    ConversationAppend,
+			Message: &cloned,
+		},
+	})
+}
+
+func sendConversationSnapshot(ctx context.Context, events chan<- Event, messages []llm.Message) bool {
+	return sendEvent(ctx, events, Event{
+		Type: EventConversation,
+		Conversation: &ConversationEvent{
+			Kind:     ConversationSnapshot,
+			Messages: cloneAgentMessages(messages),
+		},
+	})
+}
+
+func cloneAgentMessages(messages []llm.Message) []llm.Message {
+	cloned := make([]llm.Message, len(messages))
+	for i, message := range messages {
+		cloned[i] = cloneAgentMessage(message)
+	}
+	return cloned
+}
+
+func cloneAgentMessage(message llm.Message) llm.Message {
+	cloned := message
+	cloned.ToolCalls = make([]llm.ToolCall, len(message.ToolCalls))
+	for i, call := range message.ToolCalls {
+		cloned.ToolCalls[i] = call
+		cloned.ToolCalls[i].Input = cloneAgentMap(call.Input)
+	}
+	if message.ToolResult != nil {
+		result := *message.ToolResult
+		cloned.ToolResult = &result
+	}
+	return cloned
+}
+
+func cloneAgentMap(value map[string]interface{}) map[string]interface{} {
+	if value == nil {
+		return nil
+	}
+	cloned := make(map[string]interface{}, len(value))
+	for key, item := range value {
+		cloned[key] = cloneAgentValue(item)
+	}
+	return cloned
+}
+
+func cloneAgentValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		return cloneAgentMap(typed)
+	case []interface{}:
+		items := make([]interface{}, len(typed))
+		for i, item := range typed {
+			items[i] = cloneAgentValue(item)
+		}
+		return items
+	default:
+		return value
+	}
+}
+
 func sendContextStatuses(ctx context.Context, events chan<- Event, statuses []conversation.ContextStatus) bool {
 	for _, status := range statuses {
 		if !sendEvent(ctx, events, Event{
@@ -254,6 +347,9 @@ func (a *Agent) emergencyCompactAndRetry(
 	}
 	if err != nil {
 		return ModelResponse{}, err
+	}
+	if !sendConversationSnapshot(ctx, events, conv.Messages()) {
+		return ModelResponse{}, ctx.Err()
 	}
 	if !sendEvent(ctx, events, Event{
 		Type: EventContext,

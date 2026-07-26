@@ -14,6 +14,14 @@ type Runtime struct {
 	stable string
 }
 
+// SessionPromptContext contains dynamic session data that must not alter the
+// cache-friendly stable system prompt or persisted conversation history.
+type SessionPromptContext struct {
+	Instructions string
+	MemoryIndex  string
+	ResumeGap    string
+}
+
 // RequestContext contains dynamic data for one model request.
 type RequestContext struct {
 	Mode             string
@@ -25,6 +33,7 @@ type RequestContext struct {
 	GitStatus        string
 	Now              time.Time
 	ReminderInterval int
+	Session          SessionPromptContext
 }
 
 // Payload is the provider-facing prompt data for one model request.
@@ -54,6 +63,17 @@ func (r *Runtime) StableSystem() string {
 func (r *Runtime) BuildPayload(ctx RequestContext) Payload {
 	payload := Payload{StableSystem: r.StableSystem()}
 	payload.Reminders = append(payload.Reminders, buildEnvironmentReminder(ctx))
+	if reminder, ok := buildContentReminder(ReminderInstructions, "Project instructions", ctx.Session.Instructions); ok {
+		payload.Reminders = append(payload.Reminders, reminder)
+	}
+	if reminder, ok := buildContentReminder(ReminderMemoryIndex, "Durable memory index", ctx.Session.MemoryIndex); ok {
+		payload.Reminders = append(payload.Reminders, reminder)
+	}
+	if ctx.Iteration <= 1 {
+		if reminder, ok := buildContentReminder(ReminderResumeGap, "Resumed session notice", ctx.Session.ResumeGap); ok {
+			payload.Reminders = append(payload.Reminders, reminder)
+		}
+	}
 	if ctx.Mode == "plan" {
 		payload.Reminders = append(payload.Reminders, buildPlanModeReminder(ctx))
 	}

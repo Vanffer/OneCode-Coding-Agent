@@ -56,11 +56,13 @@ type RuleSet struct {
 
 // Request is the authorization input for one tool call.
 type Request struct {
-	ID       string
-	Tool     string
-	Args     map[string]interface{}
-	Safety   tools.Safety
-	Category tools.ToolCategory
+	ID         string
+	Tool       string
+	Args       map[string]interface{}
+	Safety     tools.Safety
+	Category   tools.ToolCategory
+	BatchIndex int
+	BatchTotal int
 }
 
 // TargetKind describes what kind of subject a tool call targets.
@@ -100,6 +102,8 @@ type ConfirmationRequest struct {
 	Target      string
 	Risk        string
 	Reason      string
+	BatchIndex  int
+	BatchTotal  int
 }
 
 // ConfirmationChoice is a user's response to a permission request.

@@ -66,3 +66,41 @@ func TestExecuteModeSkipsPlanReminder(t *testing.T) {
 		t.Fatalf("expected environment reminder, got %q", payload.Reminders[0].Kind)
 	}
 }
+
+func TestResumeGapOnlyAppearsOnFirstIteration(t *testing.T) {
+	runtime, err := NewRuntime(BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := RequestContext{
+		Mode: "execute",
+		Now:  time.Date(2026, 7, 17, 10, 0, 0, 0, time.UTC),
+		Session: SessionPromptContext{
+			Instructions: "rules",
+			MemoryIndex:  "memory",
+			ResumeGap:    "resumed after a long gap",
+		},
+	}
+	ctx.Iteration = 1
+	first := runtime.BuildPayload(ctx)
+	ctx.Iteration = 2
+	second := runtime.BuildPayload(ctx)
+	if !hasReminder(first.Reminders, ReminderResumeGap) {
+		t.Fatal("expected resume gap on first iteration")
+	}
+	if hasReminder(second.Reminders, ReminderResumeGap) {
+		t.Fatal("resume gap must not repeat after first iteration")
+	}
+	if !hasReminder(second.Reminders, ReminderInstructions) || !hasReminder(second.Reminders, ReminderMemoryIndex) {
+		t.Fatal("instructions and memory should remain on later iterations")
+	}
+}
+
+func hasReminder(reminders []Reminder, kind ReminderKind) bool {
+	for _, reminder := range reminders {
+		if reminder.Kind == kind {
+			return true
+		}
+	}
+	return false
+}

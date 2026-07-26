@@ -41,6 +41,7 @@ func buildRequestContext(ctx context.Context, opts RunOptions, iteration int) pr
 		GitStatus:        collectGitStatus(ctx, cwd),
 		Now:              time.Now(),
 		ReminderInterval: opts.ReminderInterval,
+		Session:          opts.PromptContext,
 	}
 }
 
